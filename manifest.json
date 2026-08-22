@@ -2,10 +2,9 @@
   "id": "daily-tasks",
   "name": "Daily Tasks",
   "description": "cool task management for daily/periodic notes!!",
-  "version": "7.0.7",
+  "version": "7.0.8",
   "minAppVersion": "0.15.0",
   "author": "Error Dev",
   "authorUrl": "https://devicals.github.io/",
-  "isDesktopOnly": false,
-  "main": "main.js"
+  "isDesktopOnly": false
 }

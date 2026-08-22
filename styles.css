@@ -60,7 +60,7 @@
 
 .task-has-schedule,
 .heading-has-type {
-  cursor: pointer !important;
+  cursor: pointer;
 }
 
 .cm-line.task-top-parent-goal,
@@ -68,8 +68,8 @@
 .cm-line.task-top-parent-goal span:not(.cm-formatting),
 li.task-top-parent-goal > p,
 li.task-top-parent-goal > span {
-  font-weight: 700 !important;
-  color: var(--text-normal, #e0d6c3) !important;
+  font-weight: 700;
+  color: var(--text-normal, #e0d6c3);
 }
 
 .cm-line.task-optional-item,
@@ -77,8 +77,8 @@ li.task-top-parent-goal > span {
 li.task-optional-item,
 li.task-optional-item > p,
 li.task-optional-item > span {
-  font-style: italic !important;
-  color: var(--text-muted, #8c7355) !important;
+  font-style: italic;
+  color: var(--text-muted, #8c7355);
 }
 
 .cm-line.task-overdue-item,
@@ -86,7 +86,7 @@ li.task-optional-item > span {
 li.task-overdue-item,
 li.task-overdue-item > p,
 li.task-overdue-item > span {
-  color: var(--text-error, #e05252) !important;
+  color: var(--text-error, #e05252);
 }
 
 .task-progress-badge {
@@ -131,6 +131,6 @@ li.task-overdue-item > span {
 }
 
 .daily-tasks-settings-btn-danger {
-  background-color: var(--text-error, #e05252) !important;
-  color: var(--text-on-accent, #ffffff) !important;
+  background-color: var(--text-error, #e05252);
+  color: var(--text-on-accent, #ffffff);
 }
