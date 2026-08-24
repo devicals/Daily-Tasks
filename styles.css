@@ -134,3 +134,44 @@ li.task-overdue-item > span {
   background-color: var(--text-error, #e05252);
   color: var(--text-on-accent, #ffffff);
 }
+
+.task-tooltip-period-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 8px;
+  row-gap: 2px;
+  align-items: baseline;
+}
+
+.task-tooltip-period-prefix {
+  text-align: right;
+  color: var(--text-muted, #8c7355);
+  font-size: 0.9em;
+  font-weight: 500;
+}
+
+.task-tooltip-period-date {
+  color: var(--text-normal, #e0d6c3);
+  font-size: 1.05em;
+  font-weight: 600;
+}
+
+.task-tooltip-diff-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  row-gap: 2px;
+  margin-top: 4px;
+  align-items: baseline;
+}
+
+.task-tooltip-diff-action {
+  text-align: right;
+  color: var(--text-muted, #8c7355);
+  font-size: 0.85em;
+  padding-right: 5px;
+}
+
+.task-tooltip-diff-val {
+  color: var(--text-muted, #8c7355);
+  font-size: 0.85em;
+}

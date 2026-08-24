@@ -31,6 +31,19 @@ i originally made this plugin for my own needs but i decided why not let everyon
 also before all the more like juicy things one small yet big thing it does is carry over your uncompleted tasks to the next day so YEAH!!
 
 
+# WHAT'S NEW??
+
+- added time periods (e.g. `:: from 2 oct to 4 oct ::`)
+- added more natural expressions (e.g. `:: this monday to next friday ::`)
+- `data.json` now autoclears non-existing tasks every 12 hours (customizable) to stop wasting space (alth it wont take up much space anyway)
+- bug fixes
+    - fixed bug where "renaming" a task would make the plugin lose track of it and therefore the task's schedule would be gone
+
+# WHAT'S NEXT??
+
+- probably add a purge button to purge all task schedules before a certain date or during a certain time period
+
+
 # before i tell you how to use this here are some cool screenshots :)
 
 ![Screenshot](images/Progress.png)
@@ -38,6 +51,8 @@ also before all the more like juicy things one small yet big thing it does is ca
 ![Screenshot](images/Hover.png)
 
 ![Screenshot](images/Birthday.png)
+
+![Screenshot](images/Period.png)
 
 # anyway so how do you even use this
 
@@ -86,6 +101,21 @@ I DONT WANT TO DO THESE THINGS TODAY
 
 
 problem solved
+
+
+## task period
+
+
+event that lasts for multiple days?
+
+
+```markdown
+- [ ] [Cubed!Con 2026](cubedcon.com) :: in 2 oct to 4 oct ::
+- [ ] boss goes on vacation so we can chill and do nothing all week :: from today to next monday ::
+```
+
+
+voila!
 
 
 ## IM ON FIRE SOMEBODY CALL THE FIREFIGHTERS
