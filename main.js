@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, MarkdownView, Notice, normalizePath } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, MarkdownView, Notice, normalizePath, Modal } = require("obsidian");
 const { ViewPlugin, Decoration, MatchDecorator, WidgetType } = require("@codemirror/view");
 
 const NUMBER_WORDS = {
@@ -28,7 +28,8 @@ function normalizeNaturalText(str) {
         .replace(/\b(st|nd|rd|th)\b/g, " ")
         .replace(/\bof\b/g, " ");
 
-    s = s.replace(/\bevery\s+other\s+day\b/g, "2 days")
+    s = s.replace(/\beveryday\b/g, "every day")
+         .replace(/\bevery\s+other\s+day\b/g, "2 days")
          .replace(/\bevery\s+other\s+week\b/g, "2 weeks")
          .replace(/\bevery\s+other\s+month\b/g, "2 months")
          .replace(/\bevery\s+other\s+year\b/g, "2 years")
@@ -77,7 +78,7 @@ function parseInterval(text) {
     let days = 0, weeks = 0, months = 0, years = 0;
     let found = false;
 
-    if (/\bdaily\b|\bevery\s+day\b/.test(s)) { days += 1; found = true; }
+    if (/\bdaily\b|\bevery\s+day\b|\beveryday\b/.test(s)) { days += 1; found = true; }
     if (/\bweekly\b|\bevery\s+week\b/.test(s)) { weeks += 1; found = true; }
     if (/\bmonthly\b|\bevery\s+month\b/.test(s)) { months += 1; found = true; }
     if (/\bannually\b|\byearly\b|\bevery\s+year\b|\bannual\b/.test(s)) { years += 1; found = true; }
@@ -305,11 +306,31 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
             }
         }
 
-        if (/^(?:starting|after|from)\s+/i.test(segLower)) {
-            const dateStr = segLower.replace(/^(?:starting|after|from)\s+/i, "").trim();
-            const parsedStart = parseNaturalDate(dateStr, baseDate);
-            if (parsedStart) explicitStartDate = parsedStart.date;
-            continue;
+        if (/\b(?:starting|after|from)\s+/i.test(segLower)) {
+            const startPartMatch = segLower.match(/\b(?:starting|after|from)\s+(.+)$/i);
+            if (startPartMatch) {
+                let dateStr = startPartMatch[1].trim();
+                if (dateStr === "tomorrow") {
+                    if (/\bafter\s+tomorrow\b/i.test(segLower)) {
+                        explicitStartDate = baseDate.clone().add(2, "days");
+                    } else {
+                        explicitStartDate = baseDate.clone().add(1, "days");
+                    }
+                } else {
+                    const parsedStart = parseNaturalDate(dateStr, baseDate);
+                    if (parsedStart) {
+                        explicitStartDate = parsedStart.date;
+                    } else {
+                        const intv = parseInterval(dateStr);
+                        if (intv) {
+                            explicitStartDate = addToDate(baseDate, intv);
+                        }
+                    }
+                }
+                if (explicitStartDate && (!explicitNextDate || explicitNextDate.isBefore(explicitStartDate, 'day'))) {
+                    explicitNextDate = explicitStartDate.clone();
+                }
+            }
         }
 
         let matchedWeekday = false;
@@ -318,7 +339,7 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
             if (new RegExp(`^${dayName}\\b`, "i").test(cleanRecurPrefix)) {
                 explicitInterval = { days: 0, weeks: 1, months: 0, years: 0 };
                 explicitRepeat = "every week";
-                explicitNextDate = explicitNextDate || getNextWeekday(baseDate, dayNum);
+                explicitNextDate = explicitNextDate || getWeekdayDate(baseDate, dayNum, null);
                 matchedWeekday = true;
                 break;
             }
@@ -345,14 +366,19 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
             continue;
         }
 
-        const interval = parseInterval(segLower);
-        const hasFreqKeyword = /\b(daily|weekly|monthly|annually|annual|yearly|fortnightly|biweekly|bidaily|tridaily|quaddaily|triweekly|quadweekly|bimonthly|trimonthly|quadmonthly|quarterly|semiannually|biannually|half-yearly|triennially|quadrennially|quinquennially|decennially)\b/i.test(segLower);
+        const recurrenceTextOnly = segLower.replace(/\b(?:starting|after|from)\s+.+$/i, "").trim();
+        const interval = parseInterval(recurrenceTextOnly || segLower);
+        const hasFreqKeyword = /\b(daily|everyday|weekly|monthly|annually|annual|yearly|fortnightly|biweekly|bidaily|tridaily|quaddaily|triweekly|quadweekly|bimonthly|trimonthly|quadmonthly|quarterly|semiannually|biannually|half-yearly|triennially|quadrennially|quinquennially|decennially)\b/i.test(segLower);
 
         if ((isRecurKeyword || hasFreqKeyword) && interval) {
             explicitInterval = interval;
             explicitRepeat = formatRepeatUnits(interval);
             if (!explicitNextDate) {
-                explicitNextDate = addToDate(baseDate, interval);
+                if (explicitStartDate) {
+                    explicitNextDate = explicitStartDate.clone();
+                } else {
+                    explicitNextDate = addToDate(baseDate, interval);
+                }
             }
             continue;
         }
@@ -440,6 +466,62 @@ function cleanTaskString(text) {
                .trim();
 }
 
+function computeTaskKey(cleanText, ancestorTexts = [], childTexts = []) {
+    if (!cleanText) return "";
+    let key = cleanText;
+    if (ancestorTexts && ancestorTexts.length > 0) {
+        key = `${ancestorTexts.join(" > ")} > ${key}`;
+    }
+    if (childTexts && childTexts.length > 0) {
+        const childPreview = childTexts.filter(Boolean).slice(0, 3).join(" | ");
+        if (childPreview) {
+            key = `${key} [sub: ${childPreview}]`;
+        }
+    }
+    return key;
+}
+
+function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTexts = []) {
+    if (!map) return null;
+    if (contextKey && map[contextKey]) return map[contextKey];
+
+    let bestEntry = null;
+    let maxScore = -1;
+
+    for (const [k, entry] of Object.entries(map)) {
+        const entryClean = entry.cleanText || cleanTaskString(k);
+        if (entryClean !== cleanText && k !== cleanText && !k.endsWith(` > ${cleanText}`)) continue;
+
+        let score = 0;
+        if (k === contextKey) score += 100;
+
+        if (entry.childTexts && childTexts && childTexts.length > 0) {
+            const matchCount = entry.childTexts.filter(c => childTexts.includes(c)).length;
+            if (matchCount > 0) {
+                score += matchCount * 30;
+            } else if (entry.childTexts.length > 0 && childTexts.length > 0) {
+                score -= 40;
+            }
+        }
+
+        if (entry.ancestorTexts && ancestorTexts && ancestorTexts.length > 0) {
+            const matchCount = entry.ancestorTexts.filter(a => ancestorTexts.includes(a)).length;
+            score += matchCount * 20;
+        }
+
+        if (score > maxScore) {
+            maxScore = score;
+            bestEntry = entry;
+        }
+    }
+
+    if (bestEntry && maxScore >= 0) return bestEntry;
+    if (map[cleanText] && (!map[cleanText].contextKey || map[cleanText].contextKey === cleanText)) {
+        return map[cleanText];
+    }
+    return bestEntry || map[cleanText] || null;
+}
+
 function cleanHeadingString(text) {
     return text.replace(/^#{1,6}\s+/, "")
                .replace(/::\s*[^:\n]*(?:::)?/g, "")
@@ -522,8 +604,18 @@ function parseNoteDateStrict(name) {
     return null;
 }
 
+function isTasksTrackerFile(file, app) {
+    if (!file) return false;
+    const cache = app.metadataCache.getFileCache(file);
+    if (!cache || !cache.frontmatter) return false;
+    const fm = cache.frontmatter;
+    return fm.tasksTracker === true || fm.tasksTracker === "true" || fm.taskstracker === true || fm.taskstracker === "true" || fm.taskTracker === true || fm.taskTracker === "true" || fm.tasktracker === true || fm.tasktracker === "true";
+}
+
 function isPeriodicOrDailyNote(file, app, folderOverride) {
     if (!file) return false;
+    if (isTasksTrackerFile(file, app)) return true;
+
     const baseName = file.basename;
     const fileFolder = file.parent ? file.parent.path.replace(/^\/|\/$/g, "") : "";
 
@@ -549,6 +641,36 @@ function isPeriodicOrDailyNote(file, app, folderOverride) {
         }
     }
     return false;
+}
+
+function isDailyNoteFile(file, app, folderOverride) {
+    if (!file) return false;
+    if (isTasksTrackerFile(file, app)) return false;
+    const baseName = file.basename;
+    const fileFolder = file.parent ? file.parent.path.replace(/^\/|\/$/g, "") : "";
+
+    if (folderOverride) {
+        const folder = folderOverride.replace(/^\/|\/$/g, "");
+        if (folder && fileFolder === folder && parseNoteDateStrict(baseName)) return true;
+    }
+
+    const dailyCore = app.internalPlugins?.plugins?.["daily-notes"];
+    if (dailyCore && dailyCore.enabled) {
+        const folder = (dailyCore.instance?.options?.folder || "").replace(/^\/|\/$/g, "");
+        if ((!folder || fileFolder === folder) && parseNoteDateStrict(baseName)) return true;
+    }
+
+    const periodic = app.plugins?.plugins?.["periodic-notes"];
+    if (periodic && periodic.settings) {
+        for (const p of ["daily", "weekly", "monthly", "quarterly", "yearly"]) {
+            const conf = periodic.settings[p];
+            if (conf && conf.enabled) {
+                const folder = (conf.folder || "").replace(/^\/|\/$/g, "");
+                if (!folder || fileFolder === folder) return true;
+            }
+        }
+    }
+    return !!parseNoteDateStrict(baseName);
 }
 
 function collectDomAncestorTaskTexts(container) {
@@ -581,6 +703,136 @@ function extractDirectTextContent(element) {
         }
     }
     return text.trim();
+}
+
+async function ensureHiddenTrackerStorage(plugin) {
+    const hiddenPath = normalizePath(".daily-tasks-imported.md");
+    const exists = await plugin.app.vault.adapter.exists(hiddenPath);
+    if (!exists) {
+        const initialContent = `---\ntasksTracker: true\n---\n\n# Imported Tasks\n\n`;
+        await plugin.app.vault.create(hiddenPath, initialContent);
+    }
+    let file = plugin.app.vault.getAbstractFileByPath(hiddenPath);
+    if (!file) {
+        file = plugin.app.vault.getMarkdownFiles().find(f => f.path === hiddenPath) || null;
+    }
+    return file;
+}
+
+async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTracker = true) {
+    const noteDate = isTracker ? window.moment() : parseNoteDateFlexible(sourceFileKey);
+    const lines = content.split("\n");
+    const lineCount = lines.length;
+    const tree = plugin.buildTaskTree(lines);
+
+    const taskItems = [];
+    for (let i = 0; i < lineCount; i++) {
+        const text = lines[i];
+        const isTask = /^\s*-\s*\[.\]/.test(text);
+        const isHeading = /^#{1,6}\s+/.test(text);
+        const indentMatch = text.match(/^(\s*)/);
+        const indent = indentMatch ? indentMatch[1].replace(/\t/g, "    ").length : 0;
+        taskItems.push({ lineNum: i, text, isTask, isHeading, indent });
+    }
+
+    let importedCount = 0;
+    const modifiedLines = [...lines];
+
+    for (let i = 0; i < lineCount; i++) {
+        const item = taskItems[i];
+        if (!item.isTask && !item.isHeading) continue;
+
+        const match = item.text.match(/(?:::|\s::)\s*([^:\n]+)\s*::$/);
+        if (!match) continue;
+
+        const rawTag = match[1].trim();
+        const cleanLine = item.text.replace(/(?:::|\s::)\s*([^:\n]+)\s*::$/, "").trimEnd();
+        modifiedLines[i] = cleanLine;
+
+        if (item.isHeading) {
+            const headingText = cleanHeadingString(cleanLine);
+            const headingType = plugin.normalizeHeadingType(rawTag);
+            if (headingType) {
+                if (!plugin.store.headings) plugin.store.headings = {};
+                if (!plugin.store.headings[sourceFileKey]) plugin.store.headings[sourceFileKey] = {};
+                plugin.store.headings[sourceFileKey][headingText.toLowerCase()] = headingType;
+            }
+            continue;
+        }
+
+        let ancestorTexts = [];
+        let curIndent = item.indent;
+        for (let p = i - 1; p >= 0; p--) {
+            if (taskItems[p].isTask && taskItems[p].indent < curIndent) {
+                ancestorTexts.unshift(cleanTaskString(taskItems[p].text));
+                curIndent = taskItems[p].indent;
+                if (curIndent === 0) break;
+            }
+        }
+
+        let childTexts = [];
+        let directChildIndent = -1;
+        for (let c = i + 1; c < lineCount; c++) {
+            if (taskItems[c].indent <= item.indent) break;
+            if (taskItems[c].isTask) {
+                if (directChildIndent === -1) directChildIndent = taskItems[c].indent;
+                if (taskItems[c].indent === directChildIndent) {
+                    childTexts.push(cleanTaskString(taskItems[c].text));
+                }
+            }
+        }
+
+        const cleanText = cleanTaskString(cleanLine);
+        const taskKey = computeTaskKey(cleanText, ancestorTexts, childTexts);
+        const parsed = parseTaskTag(rawTag, noteDate, null);
+
+        if (!parsed.isClear) {
+            let repeat = parsed.explicitRepeat;
+            let orig = parsed.explicitOrigDate ? parsed.explicitOrigDate.format("YYYY-MM-DD") : noteDate.format("YYYY-MM-DD");
+            let start = parsed.explicitStartDate ? parsed.explicitStartDate.format("YYYY-MM-DD") : null;
+            let until = parsed.explicitUntilDate ? parsed.explicitUntilDate.format("YYYY-MM-DD") : null;
+            let isOptional = parsed.hasExplicitOptional ? parsed.isOptional : false;
+
+            let nextStr = null;
+            if (parsed.explicitNextDate) {
+                nextStr = parsed.explicitNextDate.format("YYYY-MM-DD");
+            } else if (start && window.moment(start, "YYYY-MM-DD").isAfter(noteDate, "day")) {
+                nextStr = start;
+            } else if (parsed.explicitInterval) {
+                if (parsed.explicitInterval.days === 1 && !parsed.explicitInterval.weeks && !parsed.explicitInterval.months && !parsed.explicitInterval.years) {
+                    nextStr = noteDate.clone().add(1, "days").format("YYYY-MM-DD");
+                } else {
+                    nextStr = addToDate(noteDate, parsed.explicitInterval).format("YYYY-MM-DD");
+                }
+            }
+
+            if (!plugin.store.tasks) plugin.store.tasks = {};
+            if (!plugin.store.tasks[sourceFileKey]) plugin.store.tasks[sourceFileKey] = {};
+
+            plugin.store.tasks[sourceFileKey][taskKey] = {
+                cleanText,
+                contextKey: taskKey,
+                ancestorTexts,
+                childTexts,
+                repeat,
+                next: nextStr,
+                orig,
+                start,
+                until,
+                isOptional,
+                streak: 0,
+                rawTag,
+                fromTracker: isTracker ? sourceFileKey : null
+            };
+            importedCount++;
+        }
+    }
+
+    if (importedCount > 0) {
+        await plugin.saveData(plugin.store);
+    }
+
+    return { importedCount, modifiedContent: modifiedLines.join("\n") };
 }
 
 function createTagDecorationExtension(plugin) {
@@ -933,6 +1185,95 @@ class TooltipManager {
     }
 }
 
+class PurgeSchedulesModal extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+        this.mode = "before";
+        this.beforeDate = window.moment().format("YYYY-MM-DD");
+        this.rangeStart = window.moment().subtract(7, "days").format("YYYY-MM-DD");
+        this.rangeEnd = window.moment().format("YYYY-MM-DD");
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h2", { text: "Purge Task Schedules" });
+
+        new Setting(contentEl)
+            .setName("Purge Mode")
+            .setDesc("Select how to purge schedule metadata across stored notes.")
+            .addDropdown((drop) => {
+                drop.addOption("before", "Before a specific date")
+                    .addOption("period", "During a date range")
+                    .setValue(this.mode)
+                    .onChange((val) => {
+                        this.mode = val;
+                        this.onOpen();
+                    });
+            });
+
+        if (this.mode === "before") {
+            new Setting(contentEl)
+                .setName("Cutoff Date")
+                .setDesc("Purge all task schedules in notes dated before this day.")
+                .addText((text) => {
+                    text.inputEl.type = "date";
+                    text.setValue(this.beforeDate)
+                        .onChange((val) => {
+                            this.beforeDate = val;
+                        });
+                });
+        } else {
+            new Setting(contentEl)
+                .setName("Start Date")
+                .setDesc("Beginning of the purge date range.")
+                .addText((text) => {
+                    text.inputEl.type = "date";
+                    text.setValue(this.rangeStart)
+                        .onChange((val) => {
+                            this.rangeStart = val;
+                        });
+                });
+
+            new Setting(contentEl)
+                .setName("End Date")
+                .setDesc("End of the purge date range.")
+                .addText((text) => {
+                    text.inputEl.type = "date";
+                    text.setValue(this.rangeEnd)
+                        .onChange((val) => {
+                            this.rangeEnd = val;
+                        });
+                });
+        }
+
+        new Setting(contentEl)
+            .addButton((btn) => {
+                btn.setButtonText("Purge Schedules")
+                   .setClass("daily-tasks-settings-btn-danger")
+                   .onClick(async () => {
+                       const res = await this.plugin.purgeTaskSchedules({
+                           mode: this.mode,
+                           beforeDate: this.beforeDate,
+                           rangeStart: this.rangeStart,
+                           rangeEnd: this.rangeEnd
+                       });
+                       new Notice(`Purged ${res.purgedTasks} task(s) across ${res.purgedNotes} note(s).`);
+                       this.close();
+                   });
+            })
+            .addButton((btn) => {
+                btn.setButtonText("Cancel").onClick(() => this.close());
+            });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
 class DailyTasksSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
@@ -955,6 +1296,70 @@ class DailyTasksSettingTab extends PluginSettingTab {
                         this.plugin.store.settings.folderOverride = value.trim();
                         await this.plugin.saveData(this.plugin.store);
                     });
+            });
+
+        new Setting(containerEl)
+            .setName("Import Tasks from File")
+            .setDesc("Import markdown or plaintext files with scheduled tasks into the hidden tasks tracker storage.")
+            .addButton((btn) => {
+                btn.setButtonText("Import File...").onClick(() => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = ".md,.txt,.markdown,text/plain,text/markdown";
+                    input.style.position = "fixed";
+                    input.style.top = "-10000px";
+                    input.style.left = "-10000px";
+                    input.style.opacity = "0";
+                    document.body.appendChild(input);
+
+                    input.onchange = async (e) => {
+                        try {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+
+                            const content = await file.text();
+                            if (!content) {
+                                new Notice("Selected file is empty.");
+                                return;
+                            }
+
+                            const hiddenFile = await ensureHiddenTrackerStorage(this.plugin);
+                            let existingContent = "";
+                            if (hiddenFile) {
+                                existingContent = await this.app.vault.read(hiddenFile);
+                            } else {
+                                existingContent = await this.app.vault.adapter.read(normalizePath(".daily-tasks-imported.md"));
+                            }
+
+                            const newContent = `${existingContent.trimEnd()}\n\n${content.trim()}\n`;
+                            const fileKey = hiddenFile ? hiddenFile.basename : ".daily-tasks-imported";
+
+                            const res = await bulkImportTasksFromContent(this.plugin, newContent, fileKey, true);
+
+                            if (hiddenFile) {
+                                await this.app.vault.modify(hiddenFile, res.modifiedContent);
+                            } else {
+                                await this.app.vault.adapter.write(normalizePath(".daily-tasks-imported.md"), res.modifiedContent);
+                            }
+
+                            new Notice(`Imported ${res.importedCount} scheduled task(s) into background tasks tracker.`);
+                        } catch (err) {
+                            new Notice(`Import failed: ${err.message || err}`);
+                        } finally {
+                            input.remove();
+                        }
+                    };
+
+                    window.addEventListener("focus", () => {
+                        setTimeout(() => {
+                            if (document.body.contains(input)) {
+                                input.remove();
+                            }
+                        }, 1000);
+                    }, { once: true });
+
+                    input.click();
+                });
             });
 
         new Setting(containerEl)
@@ -990,6 +1395,15 @@ class DailyTasksSettingTab extends PluginSettingTab {
                 btn.setButtonText("Clean Now").onClick(async () => {
                     const res = await this.plugin.cleanupNonExistingTasks();
                     new Notice(`Cleaned up ${res.cleanedTasks} stale task(s) across ${res.cleanedFiles} note file(s).`);
+                });
+            });
+
+        new Setting(containerEl)
+            .setName("Purge Schedules by Date/Period")
+            .setDesc("Delete stored task schedule data before a specific date or within a selected date range.")
+            .addButton((btn) => {
+                btn.setButtonText("Purge Schedules...").onClick(() => {
+                    new PurgeSchedulesModal(this.app, this.plugin).open();
                 });
             });
 
@@ -1044,6 +1458,7 @@ class TasksTemplateApi {
     }
 }
 
+
 module.exports = class DailyTasksPlugin extends Plugin {
     async onload() {
         const loaded = await this.loadData();
@@ -1081,7 +1496,25 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         this.registerEvent(
             this.app.workspace.on("file-menu", (menu, file) => {
-                if (!file || !isPeriodicOrDailyNote(file, this.app, this.store.settings.folderOverride)) return;
+                if (!file) return;
+
+                menu.addItem((item) => {
+                    item.setTitle("Import Tasks from this File")
+                        .setIcon("download")
+                        .onClick(async () => {
+                            const content = await this.app.vault.read(file);
+                            const isTracker = isTasksTrackerFile(file, this.app);
+                            const result = await bulkImportTasksFromContent(this, content, file.basename, isTracker);
+                            if (result.importedCount > 0) {
+                                await this.app.vault.modify(file, result.modifiedContent);
+                                new Notice(`Successfully imported ${result.importedCount} scheduled task(s) from "${file.basename}".`);
+                            } else {
+                                new Notice(`No unimported scheduled task tags found in "${file.basename}".`);
+                            }
+                        });
+                });
+
+                if (!isPeriodicOrDailyNote(file, this.app, this.store.settings.folderOverride)) return;
                 menu.addItem((item) => {
                     item.setTitle("Clear Scheduled Tasks")
                         .setIcon("trash")
@@ -1102,7 +1535,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
             if (!isPeriodicOrDailyNote(activeView.file, this.app, this.store.settings.folderOverride)) return;
 
             const fileKey = activeView.file.basename;
-            const noteDate = parseNoteDateFlexible(fileKey);
+            const isTracker = isTasksTrackerFile(activeView.file, this.app);
+            const noteDate = isTracker ? window.moment() : parseNoteDateFlexible(fileKey);
 
             const headingEl = evt.target.closest("h1, h2, h3, h4, h5, h6, .HyperMD-header");
             if (headingEl) {
@@ -1120,6 +1554,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
             let cleanText = "";
             let ancestorCleanTexts = [];
+            let childCleanTexts = [];
 
             const cmView = activeView.editor && activeView.editor.cm;
             if (cmView && typeof cmView.posAtDOM === "function") {
@@ -1136,10 +1571,26 @@ module.exports = class DailyTasksPlugin extends Plugin {
                             if (/^\s*-\s*\[.\]/.test(pLine)) {
                                 const pIndent = (pLine.match(/^(\s*)/)[1] || "").replace(/\t/g, "    ").length;
                                 if (pIndent < currentIndent) {
-                                    ancestorCleanTexts.push(cleanTaskString(pLine));
+                                    ancestorCleanTexts.unshift(cleanTaskString(pLine));
                                     currentIndent = pIndent;
                                     if (currentIndent === 0) break;
                                 }
+                            }
+                        }
+                    }
+
+                    const totalLines = activeView.editor.lineCount();
+                    const selfIndent = (line.match(/^(\s*)/)[1] || "").replace(/\t/g, "    ").length;
+                    let directChildIndent = -1;
+                    for (let c = lineNum + 1; c < totalLines; c++) {
+                        const cLine = activeView.editor.getLine(c);
+                        const cIndentMatch = cLine.match(/^(\s*)/);
+                        const cIndent = cIndentMatch ? cIndentMatch[1].replace(/\t/g, "    ").length : 0;
+                        if (cIndent <= selfIndent) break;
+                        if (/^\s*-\s*\[.\]/.test(cLine)) {
+                            if (directChildIndent === -1) directChildIndent = cIndent;
+                            if (cIndent === directChildIndent) {
+                                childCleanTexts.push(cleanTaskString(cLine));
                             }
                         }
                     }
@@ -1156,7 +1607,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
             if (!cleanText) return;
 
-            let data = this.getTaskData(fileKey, cleanText);
+            let data = this.getTaskData(fileKey, cleanText, { ancestorTexts: ancestorCleanTexts, childTexts: childCleanTexts });
             if (!data) {
                 for (const ancestorText of ancestorCleanTexts) {
                     data = this.getTaskData(fileKey, ancestorText);
@@ -1196,9 +1647,22 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         this.registerEvent(
             this.app.workspace.on("file-open", async (file) => {
-                if (!file || !isPeriodicOrDailyNote(file, this.app, this.store.settings.folderOverride)) return;
+                if (!file) return;
+                const isDailyOrTracker = isPeriodicOrDailyNote(file, this.app, this.store.settings.folderOverride);
+                if (!isDailyOrTracker) return;
+
                 const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
                 if (activeView && activeView.editor) {
+                    const content = activeView.editor.getValue();
+                    const tagMatches = content.match(/(?:::|\s::)\s*([^:\n]+)\s*::/g);
+                    if (tagMatches && tagMatches.length >= 10) {
+                        const isTracker = isTasksTrackerFile(file, this.app);
+                        const res = await bulkImportTasksFromContent(this, content, file.basename, isTracker);
+                        if (res.importedCount > 0) {
+                            activeView.editor.setValue(res.modifiedContent);
+                        }
+                    }
+
                     this.updateFileSnapshot(activeView.editor, file.basename);
                     this.requestScan(activeView.editor, file.basename);
                 }
@@ -1206,6 +1670,9 @@ module.exports = class DailyTasksPlugin extends Plugin {
         );
 
         this.setupCleanupInterval();
+        setTimeout(async () => {
+            await this.cleanupExpiredTrackerTasks();
+        }, 1200);
     }
 
     updateFileSnapshot(editor, fileKey) {
@@ -1409,9 +1876,10 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
             const taskEntries = this.store.tasks[fileKey];
             if (taskEntries) {
-                for (const taskText of Object.keys(taskEntries)) {
-                    if (!existingTaskTexts.has(taskText)) {
-                        delete taskEntries[taskText];
+                for (const taskKey of Object.keys(taskEntries)) {
+                    const clean = taskEntries[taskKey].cleanText || cleanTaskString(taskKey);
+                    if (!existingTaskTexts.has(clean)) {
+                        delete taskEntries[taskKey];
                         cleanedTasks++;
                         changed = true;
                     }
@@ -1444,6 +1912,144 @@ module.exports = class DailyTasksPlugin extends Plugin {
         return { cleanedTasks, cleanedFiles };
     }
 
+    async cleanupExpiredTrackerTasks() {
+        const trackerFiles = this.getAllTasksTrackerFiles();
+        if (trackerFiles.length === 0) return;
+
+        const today = window.moment().startOf('day');
+
+        for (const file of trackerFiles) {
+            let content = "";
+            try {
+                content = await this.app.vault.read(file);
+            } catch (e) {
+                continue;
+            }
+
+            const lines = content.split("\n");
+            const tree = this.buildTaskTree(lines);
+            let hasDeletions = false;
+
+            const shouldDeleteTrackerItem = (item) => {
+                if (!item.isTask) return false;
+                const cleanText = cleanTaskString(item.raw);
+                const childTexts = item.children.map(c => cleanTaskString(c.raw));
+                const contextKey = computeTaskKey(cleanText, [], childTexts);
+                const data = this.getTaskData(file.basename, cleanText, { contextKey, childTexts });
+                if (!data) return false;
+
+                if (data.repeat) return false;
+
+                if (data.until) {
+                    const untilM = window.moment(data.until, "YYYY-MM-DD");
+                    if (untilM.isValid() && today.isAfter(untilM, 'day')) {
+                        return true;
+                    }
+                } else if (data.next) {
+                    const nextM = window.moment(data.next, "YYYY-MM-DD");
+                    if (nextM.isValid() && today.isAfter(nextM, 'day')) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            const filterTrackerTree = (nodes) => {
+                const result = [];
+                for (const node of nodes) {
+                    if (shouldDeleteTrackerItem(node)) {
+                        hasDeletions = true;
+                        const cleanText = cleanTaskString(node.raw);
+                        const childTexts = node.children.map(c => cleanTaskString(c.raw));
+                        const contextKey = computeTaskKey(cleanText, [], childTexts);
+                        if (this.store.tasks && this.store.tasks[file.basename]) {
+                            delete this.store.tasks[file.basename][contextKey];
+                            delete this.store.tasks[file.basename][cleanText];
+                        }
+                        continue;
+                    }
+                    node.children = filterTrackerTree(node.children);
+                    result.push(node);
+                }
+                return result;
+            };
+
+            const filteredTree = filterTrackerTree(tree);
+
+            if (hasDeletions) {
+                const newLines = [];
+                const nonTaskLeading = [];
+
+                for (const l of lines) {
+                    if (/^\s*-\s*\[.\]/.test(l)) {
+                        break;
+                    }
+                    nonTaskLeading.push(l);
+                }
+
+                newLines.push(...nonTaskLeading);
+                for (const item of filteredTree) {
+                    newLines.push(...this.formatTaskTree(item, false));
+                }
+
+                await this.app.vault.modify(file, newLines.join("\n"));
+            }
+        }
+
+        await this.saveData(this.store);
+    }
+
+    async purgeTaskSchedules(options) {
+        if (!this.store || !this.store.tasks) return { purgedTasks: 0, purgedNotes: 0 };
+
+        let purgedTasks = 0;
+        let purgedNotes = 0;
+        let changed = false;
+
+        const fileKeys = Object.keys(this.store.tasks);
+
+        for (const fileKey of fileKeys) {
+            const noteDate = parseNoteDateStrict(fileKey) || parseNoteDateFlexible(fileKey);
+            if (!noteDate.isValid()) continue;
+
+            let shouldPurge = false;
+            if (options.mode === "before") {
+                const cutoff = window.moment(options.beforeDate, "YYYY-MM-DD").startOf("day");
+                if (cutoff.isValid() && noteDate.isBefore(cutoff, "day")) {
+                    shouldPurge = true;
+                }
+            } else if (options.mode === "period") {
+                const start = window.moment(options.rangeStart, "YYYY-MM-DD").startOf("day");
+                const end = window.moment(options.rangeEnd, "YYYY-MM-DD").endOf("day");
+                if (start.isValid() && end.isValid() && noteDate.isSameOrAfter(start, "day") && noteDate.isSameOrBefore(end, "day")) {
+                    shouldPurge = true;
+                }
+            }
+
+            if (shouldPurge) {
+                const count = Object.keys(this.store.tasks[fileKey] || {}).length;
+                delete this.store.tasks[fileKey];
+                if (this.store.headings && this.store.headings[fileKey]) {
+                    delete this.store.headings[fileKey];
+                }
+                purgedTasks += count;
+                purgedNotes++;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            await this.saveData(this.store);
+        }
+
+        return { purgedTasks, purgedNotes };
+    }
+
+    getAllTasksTrackerFiles() {
+        const allFiles = this.app.vault.getMarkdownFiles();
+        return allFiles.filter(f => isTasksTrackerFile(f, this.app));
+    }
+
     requestScan(editor, fileKey) {
         if (this.scanTimeout) clearTimeout(this.scanTimeout);
         this.scanTimeout = setTimeout(async () => {
@@ -1453,21 +2059,65 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
     async scanAndProcessDocument(editor, fileKey) {
         const lineCount = editor.lineCount();
-        const noteDate = parseNoteDateFlexible(fileKey);
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const file = activeView?.file;
+        const isTracker = file ? isTasksTrackerFile(file, this.app) : false;
+        const noteDate = isTracker ? window.moment() : parseNoteDateFlexible(fileKey);
         const updates = [];
 
+        const lines = [];
         for (let i = 0; i < lineCount; i++) {
-            const line = editor.getLine(i);
-            const isTask = /^\s*-\s*\[.\]/.test(line);
-            const isHeading = /^#{1,6}\s+/.test(line);
+            const text = editor.getLine(i);
+            const isTask = /^\s*-\s*\[.\]/.test(text);
+            const isHeading = /^#{1,6}\s+/.test(text);
+            const indentMatch = text.match(/^(\s*)/);
+            const indent = indentMatch ? indentMatch[1].replace(/\t/g, "    ").length : 0;
+            lines.push({ lineNum: i, text, isTask, isHeading, indent });
+        }
 
-            if (!isTask && !isHeading) continue;
+        for (let i = 0; i < lineCount; i++) {
+            const item = lines[i];
+            if (!item.isTask && !item.isHeading) continue;
 
-            const match = line.match(/(?:::|\s::)\s*([^:\n]+)\s*::$/);
+            const match = item.text.match(/(?:::|\s::)\s*([^:\n]+)\s*::$/);
             if (match) {
                 const rawTag = match[1].trim();
-                const cleanLine = line.replace(/(?:::|\s::)\s*([^:\n]+)\s*::$/, "").trimEnd();
-                updates.push({ lineNum: i, newText: cleanLine, rawTag, isHeading, isTask });
+                const cleanLine = item.text.replace(/(?:::|\s::)\s*([^:\n]+)\s*::$/, "").trimEnd();
+
+                let ancestorTexts = [];
+                let childTexts = [];
+
+                if (item.isTask) {
+                    let curIndent = item.indent;
+                    for (let p = i - 1; p >= 0; p--) {
+                        if (lines[p].isTask && lines[p].indent < curIndent) {
+                            ancestorTexts.unshift(cleanTaskString(lines[p].text));
+                            curIndent = lines[p].indent;
+                            if (curIndent === 0) break;
+                        }
+                    }
+
+                    let directChildIndent = -1;
+                    for (let c = i + 1; c < lineCount; c++) {
+                        if (lines[c].indent <= item.indent) break;
+                        if (lines[c].isTask) {
+                            if (directChildIndent === -1) directChildIndent = lines[c].indent;
+                            if (lines[c].indent === directChildIndent) {
+                                childTexts.push(cleanTaskString(lines[c].text));
+                            }
+                        }
+                    }
+                }
+
+                updates.push({
+                    lineNum: i,
+                    newText: cleanLine,
+                    rawTag,
+                    isHeading: item.isHeading,
+                    isTask: item.isTask,
+                    ancestorTexts,
+                    childTexts
+                });
             }
         }
 
@@ -1483,14 +2133,15 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     }
                 } else if (u.isTask) {
                     const cleanText = cleanTaskString(u.newText);
-                    const existing = this.getTaskData(fileKey, cleanText) || {};
+                    const taskKey = computeTaskKey(cleanText, u.ancestorTexts, u.childTexts);
+                    const existing = this.getTaskData(fileKey, cleanText, { contextKey: taskKey, ancestorTexts: u.ancestorTexts, childTexts: u.childTexts }) || {};
                     const parsed = parseTaskTag(u.rawTag, noteDate, existing);
 
                     if (parsed.isClear) {
-                        await this.deleteTaskData(fileKey, cleanText);
+                        await this.deleteTaskData(fileKey, taskKey, cleanText);
                     } else {
                         let repeat = parsed.explicitRepeat !== null ? parsed.explicitRepeat : (existing.repeat || null);
-                        let orig = parsed.explicitOrigDate ? parsed.explicitOrigDate.format("YYYY-MM-DD") : (existing.orig || null);
+                        let orig = parsed.explicitOrigDate ? parsed.explicitOrigDate.format("YYYY-MM-DD") : (existing.orig || (isTracker ? noteDate.format("YYYY-MM-DD") : null));
                         let start = parsed.explicitStartDate ? parsed.explicitStartDate.format("YYYY-MM-DD") : (existing.start || null);
                         let until = parsed.explicitUntilDate ? parsed.explicitUntilDate.format("YYYY-MM-DD") : (existing.until || null);
                         let isOptional = parsed.hasExplicitOptional ? parsed.isOptional : (existing.isOptional || false);
@@ -1499,6 +2150,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
                         let nextStr = null;
                         if (parsed.explicitNextDate) {
                             nextStr = parsed.explicitNextDate.format("YYYY-MM-DD");
+                        } else if (start && window.moment(start, "YYYY-MM-DD").isAfter(noteDate, "day")) {
+                            nextStr = start;
                         } else if (existing.next && !parsed.explicitRepeat) {
                             nextStr = existing.next;
                         } else if (parsed.explicitInterval) {
@@ -1509,7 +2162,11 @@ module.exports = class DailyTasksPlugin extends Plugin {
                             }
                         }
 
-                        await this.saveTaskData(fileKey, cleanText, {
+                        await this.saveTaskData(fileKey, taskKey, {
+                            cleanText,
+                            contextKey: taskKey,
+                            ancestorTexts: u.ancestorTexts,
+                            childTexts: u.childTexts,
                             repeat,
                             next: nextStr,
                             orig,
@@ -1517,7 +2174,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
                             until,
                             isOptional,
                             streak,
-                            rawTag: u.rawTag
+                            rawTag: u.rawTag,
+                            fromTracker: isTracker ? fileKey : (existing.fromTracker || null)
                         });
                     }
                 }
@@ -1705,36 +2363,49 @@ module.exports = class DailyTasksPlugin extends Plugin {
         return null;
     }
 
-    async saveTaskData(fileKey, taskText, data) {
+    async saveTaskData(fileKey, taskKey, data) {
         if (!this.store.tasks) this.store.tasks = {};
         if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
-        this.store.tasks[fileKey][taskText] = data;
+        this.store.tasks[fileKey][taskKey] = data;
         await this.saveData(this.store);
     }
 
-    async deleteTaskData(fileKey, taskText) {
-        if (this.store.tasks && this.store.tasks[fileKey] && this.store.tasks[fileKey][taskText]) {
-            delete this.store.tasks[fileKey][taskText];
+    async deleteTaskData(fileKey, taskKey, cleanText = null) {
+        if (this.store.tasks && this.store.tasks[fileKey]) {
+            if (this.store.tasks[fileKey][taskKey]) {
+                delete this.store.tasks[fileKey][taskKey];
+            }
+            if (cleanText && this.store.tasks[fileKey][cleanText]) {
+                delete this.store.tasks[fileKey][cleanText];
+            }
         }
         if (this.store.tasks) {
             for (const f of Object.keys(this.store.tasks)) {
-                if (this.store.tasks[f] && this.store.tasks[f][taskText]) {
-                    delete this.store.tasks[f][taskText];
+                if (this.store.tasks[f]) {
+                    if (this.store.tasks[f][taskKey]) delete this.store.tasks[f][taskKey];
+                    if (cleanText && this.store.tasks[f][cleanText]) delete this.store.tasks[f][cleanText];
                 }
             }
         }
         await this.saveData(this.store);
     }
 
-    getTaskData(fileKey, taskText) {
+    getTaskData(fileKey, taskText, context = {}) {
         const noteDate = parseNoteDateFlexible(fileKey);
-        if (this.store.tasks && this.store.tasks[fileKey] && this.store.tasks[fileKey][taskText]) {
-            const currentData = this.store.tasks[fileKey][taskText];
-            if (currentData.repeat && /every\s+day|daily/i.test(currentData.repeat)) {
-                const nextStr = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
-                return { ...currentData, next: nextStr };
+        const contextKey = context.contextKey || computeTaskKey(taskText, context.ancestorTexts, context.childTexts);
+
+        if (this.store.tasks && this.store.tasks[fileKey]) {
+            const currentData = matchTaskEntry(this.store.tasks[fileKey], taskText, contextKey, context.ancestorTexts, context.childTexts);
+            if (currentData) {
+                if (currentData.repeat && /every\s+day|daily/i.test(currentData.repeat)) {
+                    const startDate = currentData.start ? window.moment(currentData.start, "YYYY-MM-DD") : null;
+                    if (!startDate || noteDate.isSameOrAfter(startDate, 'day')) {
+                        const nextStr = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
+                        return { ...currentData, next: nextStr };
+                    }
+                }
+                return currentData;
             }
-            return currentData;
         }
 
         if (this.store.tasks) {
@@ -1745,13 +2416,19 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
             for (const item of sortedFiles) {
                 const map = this.store.tasks[item.name];
-                if (map && map[taskText]) {
-                    const inherited = { ...map[taskText] };
-                    if (inherited.repeat && /every\s+day|daily/i.test(inherited.repeat)) {
-                        inherited.next = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
+                if (map) {
+                    const matched = matchTaskEntry(map, taskText, contextKey, context.ancestorTexts, context.childTexts);
+                    if (matched) {
+                        const inherited = { ...matched };
+                        if (inherited.repeat && /every\s+day|daily/i.test(inherited.repeat)) {
+                            const startDate = inherited.start ? window.moment(inherited.start, "YYYY-MM-DD") : null;
+                            if (!startDate || noteDate.isSameOrAfter(startDate, 'day')) {
+                                inherited.next = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
+                            }
+                        }
+                        this.saveTaskData(fileKey, contextKey || taskText, inherited);
+                        return inherited;
                     }
-                    this.saveTaskData(fileKey, taskText, inherited);
-                    return inherited;
                 }
             }
         }
@@ -1810,11 +2487,13 @@ module.exports = class DailyTasksPlugin extends Plugin {
         return out;
     }
 
-    filterTreeBySchedule(item, currentNoteTitle, prevNoteTitle, parentSchedule) {
+    filterTreeBySchedule(item, currentNoteTitle, prevNoteTitle, parentSchedule, ancestorTexts = []) {
         const noteDate = parseNoteDateFlexible(currentNoteTitle);
         const cleanText = cleanTaskString(item.raw);
+        const childTexts = item.children.map(c => cleanTaskString(c.raw));
+        const contextKey = computeTaskKey(cleanText, ancestorTexts, childTexts);
 
-        let data = this.getTaskData(prevNoteTitle, cleanText);
+        let data = this.getTaskData(prevNoteTitle, cleanText, { contextKey, ancestorTexts, childTexts });
         if (!data && parentSchedule) {
             data = parentSchedule;
         }
@@ -1823,19 +2502,29 @@ module.exports = class DailyTasksPlugin extends Plugin {
         if (data) {
             const interval = data.repeat ? parseInterval(data.repeat) : null;
             const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years;
-            if (isDaily) {
+            const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
+            if (isDaily && (!startDate || noteDate.isSameOrAfter(startDate, 'day'))) {
                 data = { ...data, next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD") };
             }
-            this.saveTaskData(currentNoteTitle, cleanText, data);
-            if (data.next) {
+            this.saveTaskData(currentNoteTitle, contextKey, {
+                ...data,
+                cleanText,
+                contextKey,
+                ancestorTexts,
+                childTexts
+            });
+            if (startDate && noteDate.isBefore(startDate, 'day')) {
+                isDueToday = false;
+            } else if (data.next) {
                 const nextM = window.moment(data.next, "YYYY-MM-DD");
                 isDueToday = nextM.isSameOrBefore(noteDate, 'day');
             }
         }
 
+        const nextAncestors = [...ancestorTexts, cleanText];
         const filteredChildren = [];
         for (const child of item.children) {
-            const childResult = this.filterTreeBySchedule(child, currentNoteTitle, prevNoteTitle, data);
+            const childResult = this.filterTreeBySchedule(child, currentNoteTitle, prevNoteTitle, data, nextAncestors);
             if (childResult) filteredChildren.push(childResult);
         }
 
@@ -1847,30 +2536,111 @@ module.exports = class DailyTasksPlugin extends Plugin {
         };
     }
 
-    evaluateRollover(prevNoteTitle, currentNoteTitle, prevLines) {
+    async getTrackerDueTasksForDate(targetNoteTitle) {
+        const noteDate = parseNoteDateFlexible(targetNoteTitle);
+        const trackerFiles = this.getAllTasksTrackerFiles();
+        const dueItems = [];
+
+        for (const file of trackerFiles) {
+            let content = "";
+            try {
+                content = await this.app.vault.read(file);
+            } catch (e) {
+                continue;
+            }
+
+            const lines = content.split("\n");
+            const tree = this.buildTaskTree(lines);
+
+            for (const rootItem of tree) {
+                if (!rootItem.isTask) continue;
+                const cleanText = cleanTaskString(rootItem.raw);
+                const childTexts = rootItem.children.map(c => cleanTaskString(c.raw));
+                const contextKey = computeTaskKey(cleanText, [], childTexts);
+                const data = this.getTaskData(file.basename, cleanText, { contextKey, childTexts });
+
+                let isDue = false;
+                if (data) {
+                    const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
+                    const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
+                    const nextDate = data.next ? window.moment(data.next, "YYYY-MM-DD") : null;
+
+                    if (untilDate && noteDate.isAfter(untilDate, 'day')) {
+                        isDue = false;
+                    } else if (data.repeat) {
+                        if (startDate) {
+                            isDue = noteDate.isSameOrAfter(startDate, 'day');
+                        } else if (nextDate) {
+                            isDue = noteDate.isSameOrAfter(nextDate, 'day');
+                        } else {
+                            isDue = true;
+                        }
+                    } else {
+                        if (startDate && untilDate) {
+                            isDue = noteDate.isSameOrAfter(startDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day');
+                        } else if (nextDate) {
+                            isDue = nextDate.isSame(noteDate, 'day');
+                        }
+                    }
+                }
+
+                if (isDue) {
+                    const processed = this.filterTreeBySchedule(rootItem, targetNoteTitle, file.basename, null, []);
+                    dueItems.push({
+                        cleanText,
+                        contextKey,
+                        lines: this.formatTaskTree(processed, true)
+                    });
+                }
+            }
+        }
+
+        return dueItems;
+    }
+
+    async evaluateRollover(prevNoteTitle, currentNoteTitle, prevLines) {
         const prevNoteDate = parseNoteDateFlexible(prevNoteTitle);
         const noteDate = parseNoteDateFlexible(currentNoteTitle);
+
+        const trackerDueItems = await this.getTrackerDueTasksForDate(currentNoteTitle);
+        const trackerReplacementMap = new Map();
+        for (const item of trackerDueItems) {
+            trackerReplacementMap.set(item.cleanText, item);
+        }
 
         const tree = this.buildTaskTree(prevLines);
         const todayTasks = [];
         const plannedTasks = [];
+        const seenCleanTexts = new Set();
 
         for (const rootItem of tree) {
             const rawLine = rootItem.raw;
             if (!rootItem.isTask) continue;
 
             const cleanText = cleanTaskString(rawLine);
-            let data = this.getTaskData(prevNoteTitle, cleanText);
+            const childTexts = rootItem.children.map(c => cleanTaskString(c.raw));
+            const contextKey = computeTaskKey(cleanText, [], childTexts);
+
+            if (trackerReplacementMap.has(cleanText)) {
+                const replacement = trackerReplacementMap.get(cleanText);
+                todayTasks.push(...replacement.lines);
+                seenCleanTexts.add(cleanText);
+                trackerReplacementMap.delete(cleanText);
+                continue;
+            }
+
+            let data = this.getTaskData(prevNoteTitle, cleanText, { contextKey, childTexts });
             if (!data) {
                 data = extractLegacyBadgeInfo(rawLine, prevNoteDate);
             }
 
-            const processedTree = this.filterTreeBySchedule(rootItem, currentNoteTitle, prevNoteTitle, null);
+            const processedTree = this.filterTreeBySchedule(rootItem, currentNoteTitle, prevNoteTitle, null, []);
             const isChecked = /^\s*-\s*\[x\]/i.test(rawLine);
 
             if (!data) {
                 if (!isChecked) {
                     todayTasks.push(...this.formatTaskTree(processedTree, false));
+                    seenCleanTexts.add(cleanText);
                 }
                 continue;
             }
@@ -1884,19 +2654,12 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 continue;
             }
 
-            if (untilDate) {
-                if (startDate && noteDate.isBefore(startDate, 'day')) {
+            if (startDate && noteDate.isBefore(startDate, 'day')) {
+                if (!data.fromTracker) {
                     plannedTasks.push(...this.formatTaskTree(processedTree, true));
-                    this.saveTaskData(currentNoteTitle, cleanText, data);
-                    continue;
-                } else if ((!startDate || noteDate.isSameOrAfter(startDate, 'day')) && noteDate.isSameOrBefore(untilDate, 'day')) {
-                    todayTasks.push(...this.formatTaskTree(processedTree, true));
-                    this.saveTaskData(currentNoteTitle, cleanText, {
-                        ...data,
-                        next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD")
-                    });
-                    continue;
                 }
+                this.saveTaskData(currentNoteTitle, contextKey, data);
+                continue;
             }
 
             const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years;
@@ -1904,7 +2667,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
             if (isDaily) {
                 const newStreak = isChecked ? (data.streak || 0) + 1 : 0;
                 todayTasks.push(...this.formatTaskTree(processedTree, true));
-                this.saveTaskData(currentNoteTitle, cleanText, {
+                seenCleanTexts.add(cleanText);
+                this.saveTaskData(currentNoteTitle, contextKey, {
                     ...data,
                     next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD"),
                     streak: newStreak
@@ -1912,10 +2676,16 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 continue;
             }
 
-            if (startDate && noteDate.isBefore(startDate, 'day')) {
-                plannedTasks.push(...this.formatTaskTree(processedTree, true));
-                this.saveTaskData(currentNoteTitle, cleanText, data);
-                continue;
+            if (untilDate) {
+                if (noteDate.isSameOrAfter(startDate || prevNoteDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day')) {
+                    todayTasks.push(...this.formatTaskTree(processedTree, true));
+                    seenCleanTexts.add(cleanText);
+                    this.saveTaskData(currentNoteTitle, contextKey, {
+                        ...data,
+                        next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD")
+                    });
+                    continue;
+                }
             }
 
             if (!targetDate && interval) {
@@ -1926,18 +2696,21 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 const isDueToday = targetDate.isSameOrBefore(noteDate, 'day');
                 if (isDueToday) {
                     todayTasks.push(...this.formatTaskTree(processedTree, true));
+                    seenCleanTexts.add(cleanText);
                     if (interval) {
                         const nextAfterToday = addToDate(noteDate, interval);
-                        this.saveTaskData(currentNoteTitle, cleanText, {
+                        this.saveTaskData(currentNoteTitle, contextKey, {
                             ...data,
                             next: nextAfterToday.format("YYYY-MM-DD")
                         });
                     } else {
-                        this.saveTaskData(currentNoteTitle, cleanText, data);
+                        this.saveTaskData(currentNoteTitle, contextKey, data);
                     }
                 } else {
-                    plannedTasks.push(...this.formatTaskTree(processedTree, true));
-                    this.saveTaskData(currentNoteTitle, cleanText, {
+                    if (!data.fromTracker) {
+                        plannedTasks.push(...this.formatTaskTree(processedTree, true));
+                    }
+                    this.saveTaskData(currentNoteTitle, contextKey, {
                         ...data,
                         next: targetDate.format("YYYY-MM-DD")
                     });
@@ -1945,8 +2718,16 @@ module.exports = class DailyTasksPlugin extends Plugin {
             } else {
                 if (!isChecked) {
                     todayTasks.push(...this.formatTaskTree(processedTree, false));
-                    this.saveTaskData(currentNoteTitle, cleanText, data);
+                    seenCleanTexts.add(cleanText);
+                    this.saveTaskData(currentNoteTitle, contextKey, data);
                 }
+            }
+        }
+
+        for (const [_, item] of trackerReplacementMap) {
+            if (!seenCleanTexts.has(item.cleanText)) {
+                todayTasks.push(...item.lines);
+                seenCleanTexts.add(item.cleanText);
             }
         }
 
@@ -1968,7 +2749,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const dateFiles = [];
         for (const f of allFiles) {
             if (f.basename === currentTitle) continue;
-            if (!isPeriodicOrDailyNote(f, this.app, this.store.settings.folderOverride)) continue;
+            if (!isDailyNoteFile(f, this.app, this.store.settings.folderOverride)) continue;
             const m = parseNoteDateFlexible(f.basename);
             if (m.isValid() && m.isBefore(noteDate, 'day')) {
                 dateFiles.push({ file: f, date: m });
@@ -1978,7 +2759,15 @@ module.exports = class DailyTasksPlugin extends Plugin {
         dateFiles.sort((a, b) => b.date.valueOf() - a.date.valueOf());
         const prevFile = dateFiles.length > 0 ? dateFiles[0].file : null;
 
-        if (!prevFile) return "- [ ] ";
+        if (!prevFile) {
+            const trackerDueItems = await this.getTrackerDueTasksForDate(currentTitle);
+            if (type === "tasks") {
+                const lines = [];
+                for (const item of trackerDueItems) lines.push(...item.lines);
+                return lines.length > 0 ? lines.join("\n") : "- [ ] ";
+            }
+            return "- [ ] ";
+        }
 
         const content = await this.app.vault.read(prevFile);
         const cache = this.app.metadataCache.getFileCache(prevFile);
@@ -2022,7 +2811,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             allPreviousTaskLines = lines.filter(l => /^\s*-\s*\[.\]/.test(l));
         }
 
-        const rollover = this.evaluateRollover(prevFile.basename, currentTitle, allPreviousTaskLines);
+        const rollover = await this.evaluateRollover(prevFile.basename, currentTitle, allPreviousTaskLines);
         return type === "tasks" ? rollover.todayTasks : rollover.plannedTasks;
     }
 

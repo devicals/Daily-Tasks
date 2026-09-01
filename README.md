@@ -33,15 +33,8 @@ also before all the more like juicy things one small yet big thing it does is ca
 
 # WHAT'S NEW??
 
-- added time periods (e.g. `:: from 2 oct to 4 oct ::`)
-- added more natural expressions (e.g. `:: this monday to next friday ::`)
-- `data.json` now autoclears non-existing tasks every 12 hours (customizable) to stop wasting space (alth it wont take up much space anyway)
-- bug fixes
-    - fixed bug where "renaming" a task would make the plugin lose track of it and therefore the task's schedule would be gone
-
-# WHAT'S NEXT??
-
-- probably add a purge button to purge all task schedules before a certain date or during a certain time period
+- added a purge button to purge all task schedules before a certain date or during a certain time period
+- added task tracker notes so you can plan tasks wthout cluttering up your daily notes
 
 
 # before i tell you how to use this here are some cool screenshots :)
@@ -124,6 +117,19 @@ voila!
 if a task repeats `:: daily ::` and you actually keep completing it (great job, you still probaby dont have more willpower than an ant), the plugin now counts how many days in a row youve checked it off, and it'll show up in the hover tooltip as like "streak: 12 days". miss a day and it resets to 0. no rewards or anything im not gamifying your life, its just a number to look at
 
 (look at it its so beautiful gaze into the abyss i mean just look isnt it so wonderful you did this thing a whole 0 times)
+
+
+## task tracker notes
+
+basically you create a note, and you give it the `taskTracker` or `tasksTracker` property, with a value of `true` (or `"true"`):
+
+```markdown
+---
+tasksTracker: True
+---
+```
+
+and then you just add a bunch of tasks and add schedules to them and itll work and you can have multiple of these notes and they wont show up in your planned tasks so theres no clutter but they will show in today's tasks when the time comes
 
 
 ## some other stuff
