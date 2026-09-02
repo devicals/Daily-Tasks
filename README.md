@@ -39,6 +39,7 @@ also before all the more like juicy things one small yet big thing it does is ca
     - fixed import tasks from file not working by removing the settings option. just import from an existing file (before you click on the file)
     - allows empty newlines in tasks for better organisation or readability ig
     - fixed task tracker planned tasks and rollover conflicts
+    - made plugin faster in loading and stuff
 
 
 # before i tell you how to use this here are some cool screenshots :)

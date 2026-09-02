@@ -575,8 +575,11 @@ function extractLegacyBadgeInfo(line, baseDate) {
     return null;
 }
 
+const DATE_CACHE = new Map();
+
 function parseNoteDateFlexible(name) {
     if (!name) return window.moment();
+    if (DATE_CACHE.has(name)) return DATE_CACHE.get(name).clone();
     const clean = name.replace(/\[|\]/g, "").trim();
     const formats = [
         "Do [of] MMM, YYYY", "Do of MMM, YYYY", "D MMM YYYY", "Do MMMM YYYY",
@@ -584,14 +587,24 @@ function parseNoteDateFlexible(name) {
     ];
     for (const f of formats) {
         const m = window.moment(clean, f, true);
-        if (m.isValid()) return m;
+        if (m.isValid()) {
+            DATE_CACHE.set(name, m);
+            return m.clone();
+        }
     }
     const loose = window.moment(clean, formats);
-    return loose.isValid() ? loose : window.moment();
+    const res = loose.isValid() ? loose : window.moment();
+    DATE_CACHE.set(name, res);
+    return res.clone();
 }
 
 function parseNoteDateStrict(name) {
     if (!name) return null;
+    const cacheKey = `strict_${name}`;
+    if (DATE_CACHE.has(cacheKey)) {
+        const cached = DATE_CACHE.get(cacheKey);
+        return cached ? cached.clone() : null;
+    }
     const clean = name.replace(/\[|\]/g, "").trim();
     const formats = [
         "Do [of] MMM, YYYY", "Do of MMM, YYYY", "D MMM YYYY", "Do MMMM YYYY",
@@ -599,8 +612,12 @@ function parseNoteDateStrict(name) {
     ];
     for (const f of formats) {
         const m = window.moment(clean, f, true);
-        if (m.isValid()) return m;
+        if (m.isValid()) {
+            DATE_CACHE.set(cacheKey, m);
+            return m.clone();
+        }
     }
+    DATE_CACHE.set(cacheKey, null);
     return null;
 }
 
@@ -1982,8 +1999,362 @@ module.exports = class DailyTasksPlugin extends Plugin {
     }
 
     getAllTasksTrackerFiles() {
+        const files = this.app.vault.getMarkdownFiles();
+        const results = [];
+        for (let i = 0; i < files.length; i++) {
+            const f = files[i];
+            const cache = this.app.metadataCache.getFileCache(f);
+            if (cache && cache.frontmatter) {
+                const fm = cache.frontmatter;
+                if (fm.tasksTracker === true || fm.tasksTracker === "true" || fm.taskstracker === true || fm.taskstracker === "true" || fm.taskTracker === true || fm.taskTracker === "true" || fm.tasktracker === true || fm.tasktracker === "true") {
+                    results.push(f);
+                }
+            }
+        }
+        return results;
+    }
+
+    async getTrackerDueTasksForDate(targetNoteTitle) {
+        const noteDate = parseNoteDateFlexible(targetNoteTitle);
+        const trackerFiles = this.getAllTasksTrackerFiles();
+        const dueItems = [];
+
+        for (let i = 0; i < trackerFiles.length; i++) {
+            const file = trackerFiles[i];
+            let content = "";
+            try {
+                content = await this.app.vault.cachedRead(file);
+            } catch (e) {
+                continue;
+            }
+
+            const lines = content.split("\n");
+            const tree = this.buildTaskTree(lines);
+
+            for (let j = 0; j < tree.length; j++) {
+                const rootItem = tree[j];
+                if (!rootItem.isTask) continue;
+                const cleanText = cleanTaskString(rootItem.raw);
+                const childTexts = rootItem.children.map(c => cleanTaskString(c.raw));
+                const contextKey = computeTaskKey(cleanText, [], childTexts);
+                const data = this.getTaskData(file.basename, cleanText, { contextKey, childTexts });
+
+                let isDue = false;
+                if (data && !data.isCleared) {
+                    const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
+                    const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
+                    const nextDate = data.next ? window.moment(data.next, "YYYY-MM-DD") : null;
+
+                    if (untilDate && noteDate.isAfter(untilDate, 'day')) {
+                        isDue = false;
+                    } else if (data.repeat) {
+                        if (startDate && noteDate.isBefore(startDate, 'day')) {
+                            isDue = false;
+                        } else {
+                            const interval = parseInterval(data.repeat);
+                            const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years;
+                            if (isDaily) {
+                                isDue = true;
+                            } else if (nextDate) {
+                                isDue = nextDate.isSameOrBefore(noteDate, 'day');
+                            } else {
+                                isDue = true;
+                            }
+                        }
+                    } else {
+                        if (startDate && untilDate) {
+                            isDue = noteDate.isSameOrAfter(startDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day');
+                        } else if (nextDate) {
+                            isDue = nextDate.isSame(noteDate, 'day');
+                        }
+                    }
+                }
+
+                if (isDue) {
+                    const processed = this.filterTreeBySchedule(rootItem, targetNoteTitle, file.basename, null, []);
+                    dueItems.push({
+                        cleanText,
+                        contextKey,
+                        lines: this.formatTaskTree(processed, true)
+                    });
+                }
+            }
+        }
+
+        return dueItems;
+    }
+
+    async evaluateRollover(prevNoteTitle, currentNoteTitle, prevLines) {
+        const prevNoteDate = parseNoteDateFlexible(prevNoteTitle);
+        const noteDate = parseNoteDateFlexible(currentNoteTitle);
+
+        const trackerDueItems = await this.getTrackerDueTasksForDate(currentNoteTitle);
+        const trackerReplacementMap = new Map();
+        for (let i = 0; i < trackerDueItems.length; i++) {
+            const item = trackerDueItems[i];
+            trackerReplacementMap.set(item.cleanText, item);
+        }
+
+        const tree = this.buildTaskTree(prevLines);
+        const todayTasks = [];
+        const plannedTasks = [];
+        const seenCleanTexts = new Set();
+
+        const pushWithBlankHandling = (targetArray, lines) => {
+            for (let i = 0; i < lines.length; i++) {
+                const l = lines[i];
+                if (l === "") {
+                    if (targetArray.length > 0 && targetArray[targetArray.length - 1] !== "") {
+                        targetArray.push("");
+                    }
+                } else {
+                    targetArray.push(l);
+                }
+            }
+        };
+
+        for (let i = 0; i < tree.length; i++) {
+            const rootItem = tree[i];
+            if (rootItem.isBlank) {
+                if (todayTasks.length > 0 && todayTasks[todayTasks.length - 1] !== "") {
+                    todayTasks.push("");
+                }
+                if (plannedTasks.length > 0 && plannedTasks[plannedTasks.length - 1] !== "") {
+                    plannedTasks.push("");
+                }
+                continue;
+            }
+
+            const rawLine = rootItem.raw;
+            if (!rootItem.isTask) continue;
+
+            const cleanText = cleanTaskString(rawLine);
+            const childTexts = rootItem.children.map(c => cleanTaskString(c.raw));
+            const contextKey = computeTaskKey(cleanText, [], childTexts);
+
+            if (trackerReplacementMap.has(cleanText)) {
+                const replacement = trackerReplacementMap.get(cleanText);
+                pushWithBlankHandling(todayTasks, replacement.lines);
+                seenCleanTexts.add(cleanText);
+                trackerReplacementMap.delete(cleanText);
+                continue;
+            }
+
+            let data = this.getTaskData(prevNoteTitle, cleanText, { contextKey, childTexts });
+            if (!data) {
+                data = extractLegacyBadgeInfo(rawLine, prevNoteDate);
+            }
+
+            const processedTree = this.filterTreeBySchedule(rootItem, currentNoteTitle, prevNoteTitle, null, []);
+            const isChecked = /^\s*-\s*\[x\]/i.test(rawLine);
+
+            if (!data || data.isCleared) {
+                if (!isChecked) {
+                    pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, false));
+                    seenCleanTexts.add(cleanText);
+                }
+                continue;
+            }
+
+            const interval = data.repeat ? parseInterval(data.repeat) : null;
+            let targetDate = data.next ? window.moment(data.next, "YYYY-MM-DD") : null;
+            const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
+            const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
+
+            if (untilDate && noteDate.isAfter(untilDate, 'day')) {
+                continue;
+            }
+
+            if (startDate && noteDate.isBefore(startDate, 'day')) {
+                if (!data.fromTracker) {
+                    pushWithBlankHandling(plannedTasks, this.formatTaskTree(processedTree, true));
+                }
+                this.saveTaskData(currentNoteTitle, contextKey, data);
+                continue;
+            }
+
+            const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years;
+
+            if (isDaily) {
+                const newStreak = isChecked ? (data.streak || 0) + 1 : 0;
+                pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
+                seenCleanTexts.add(cleanText);
+                this.saveTaskData(currentNoteTitle, contextKey, {
+                    ...data,
+                    next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD"),
+                    streak: newStreak
+                });
+                continue;
+            }
+
+            if (untilDate) {
+                if (noteDate.isSameOrAfter(startDate || prevNoteDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day')) {
+                    pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
+                    seenCleanTexts.add(cleanText);
+                    this.saveTaskData(currentNoteTitle, contextKey, {
+                        ...data,
+                        next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD")
+                    });
+                    continue;
+                }
+            }
+
+            if (!targetDate && interval) {
+                targetDate = addToDate(prevNoteDate, interval);
+            }
+
+            if (targetDate) {
+                const isDueToday = targetDate.isSameOrBefore(noteDate, 'day');
+                if (isDueToday) {
+                    pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
+                    seenCleanTexts.add(cleanText);
+                    if (interval) {
+                        const nextAfterToday = addToDate(noteDate, interval);
+                        this.saveTaskData(currentNoteTitle, contextKey, {
+                            ...data,
+                            next: nextAfterToday.format("YYYY-MM-DD")
+                        });
+                    } else {
+                        this.saveTaskData(currentNoteTitle, contextKey, data);
+                    }
+                } else {
+                    if (!data.fromTracker) {
+                        pushWithBlankHandling(plannedTasks, this.formatTaskTree(processedTree, true));
+                    }
+                    this.saveTaskData(currentNoteTitle, contextKey, {
+                        ...data,
+                        next: targetDate.format("YYYY-MM-DD")
+                    });
+                }
+            } else {
+                if (!isChecked) {
+                    pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, false));
+                    seenCleanTexts.add(cleanText);
+                    this.saveTaskData(currentNoteTitle, contextKey, data);
+                }
+            }
+        }
+
+        for (const [_, item] of trackerReplacementMap) {
+            if (!seenCleanTexts.has(item.cleanText)) {
+                if (todayTasks.length > 0 && todayTasks[todayTasks.length - 1] !== "") {
+                    todayTasks.push("");
+                }
+                pushWithBlankHandling(todayTasks, item.lines);
+                seenCleanTexts.add(item.cleanText);
+            }
+        }
+
+        const cleanFinalArray = (arr) => {
+            const cleaned = [];
+            for (let i = 0; i < arr.length; i++) {
+                const line = arr[i];
+                if (line === "") {
+                    if (cleaned.length > 0 && cleaned[cleaned.length - 1] !== "") {
+                        cleaned.push("");
+                    }
+                } else {
+                    cleaned.push(line);
+                }
+            }
+            while (cleaned.length > 0 && cleaned[0] === "") cleaned.shift();
+            while (cleaned.length > 0 && cleaned[cleaned.length - 1] === "") cleaned.pop();
+            return cleaned;
+        };
+
+        const finalToday = cleanFinalArray(todayTasks);
+        const finalPlanned = cleanFinalArray(plannedTasks);
+
+        this.flushStore();
+
+        return {
+            todayTasks: finalToday.length > 0 ? finalToday.join("\n") : "- [ ] ",
+            plannedTasks: finalPlanned.length > 0 ? finalPlanned.join("\n") : "- [ ] "
+        };
+    }
+
+    async getRolloverContent(type, tpTitle) {
+        let resolvedTitle = tpTitle;
+        if (resolvedTitle && typeof resolvedTitle === "object") {
+            resolvedTitle = resolvedTitle.file?.title || resolvedTitle.title || null;
+        }
+        const currentTitle = resolvedTitle || (this.app.workspace.getActiveFile() ? this.app.workspace.getActiveFile().basename : window.moment().format("YYYY-MM-DD"));
+        const noteDate = parseNoteDateFlexible(currentTitle);
+
         const allFiles = this.app.vault.getMarkdownFiles();
-        return allFiles.filter(f => isTasksTrackerFile(f, this.app));
+        const dateFiles = [];
+        for (let i = 0; i < allFiles.length; i++) {
+            const f = allFiles[i];
+            if (f.basename === currentTitle) continue;
+            if (!isDailyNoteFile(f, this.app, this.store.settings.folderOverride)) continue;
+            const m = parseNoteDateFlexible(f.basename);
+            if (m.isValid() && m.isBefore(noteDate, 'day')) {
+                dateFiles.push({ file: f, date: m });
+            }
+        }
+
+        dateFiles.sort((a, b) => b.date.valueOf() - a.date.valueOf());
+        const prevFile = dateFiles.length > 0 ? dateFiles[0].file : null;
+
+        if (!prevFile) {
+            const trackerDueItems = await this.getTrackerDueTasksForDate(currentTitle);
+            if (type === "tasks") {
+                const lines = [];
+                for (let i = 0; i < trackerDueItems.length; i++) lines.push(...trackerDueItems[i].lines);
+                return lines.length > 0 ? lines.join("\n") : "- [ ] ";
+            }
+            return "- [ ] ";
+        }
+
+        const content = await this.app.vault.cachedRead(prevFile);
+        const cache = this.app.metadataCache.getFileCache(prevFile);
+        const lines = content.split("\n");
+        const headings = cache ? cache.headings || [] : [];
+
+        const getSectionLines = (hName) => {
+            const target = headings.find(h => cleanHeadingString(h.heading).toLowerCase() === hName.toLowerCase());
+            if (!target) return [];
+            const startLine = target.position.start.line + 1;
+            const nextHeader = headings.find(h => h.position.start.line > target.position.start.line);
+            const endLine = nextHeader ? nextHeader.position.start.line : lines.length;
+            return lines.slice(startLine, endLine);
+        };
+
+        let allPreviousTaskLines = [];
+        let sectionDetected = false;
+
+        for (let i = 0; i < headings.length; i++) {
+            const h = headings[i];
+            const rawH = h.heading;
+            const hClean = cleanHeadingString(rawH);
+
+            let hType = this.getHeadingType(prevFile.basename, hClean);
+
+            if (!hType && /::\s*([^:\n]+)\s*::/.test(rawH)) {
+                const match = rawH.match(/::\s*([^:\n]+)\s*::/);
+                if (match) hType = this.normalizeHeadingType(match[1]);
+            }
+            if (!hType) {
+                if (/today'?s?\s*tasks?/i.test(hClean)) hType = "tasks";
+                else if (/planned\s*tasks?/i.test(hClean)) hType = "plan";
+            }
+
+            if (hType === "tasks" || hType === "plan") {
+                allPreviousTaskLines = allPreviousTaskLines.concat(getSectionLines(hClean));
+                sectionDetected = true;
+            }
+        }
+
+        if (!sectionDetected) {
+            for (let i = 0; i < lines.length; i++) {
+                if (/^\s*-\s*\[.\]/.test(lines[i])) {
+                    allPreviousTaskLines.push(lines[i]);
+                }
+            }
+        }
+
+        const rollover = await this.evaluateRollover(prevFile.basename, currentTitle, allPreviousTaskLines);
+        return type === "tasks" ? rollover.todayTasks : rollover.plannedTasks;
     }
 
     requestScan(editor, fileKey) {
@@ -2299,14 +2670,27 @@ module.exports = class DailyTasksPlugin extends Plugin {
         return null;
     }
 
-    async saveTaskData(fileKey, taskKey, data) {
-        if (!this.store.tasks) this.store.tasks = {};
-        if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
-        this.store.tasks[fileKey][taskKey] = data;
+    requestSaveStore() {
+        if (this._saveTimeout) clearTimeout(this._saveTimeout);
+        this._saveTimeout = setTimeout(async () => {
+            await this.saveData(this.store);
+        }, 300);
+    }
+
+    async flushStore() {
+        if (this._saveTimeout) clearTimeout(this._saveTimeout);
         await this.saveData(this.store);
     }
 
-    async deleteTaskData(fileKey, taskKey, cleanText = null) {
+    saveTaskData(fileKey, taskKey, data) {
+        if (!this.store.tasks) this.store.tasks = {};
+        if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
+        this.store.tasks[fileKey][taskKey] = data;
+        this.invalidateSortCache();
+        this.requestSaveStore();
+    }
+
+    deleteTaskData(fileKey, taskKey, cleanText = null) {
         const activeFile = this.app.vault.getMarkdownFiles().find(f => f.basename === fileKey);
         const isTracker = isTasksTrackerFile(activeFile, this.app);
 
@@ -2319,7 +2703,24 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 this.store.tasks[fileKey][targetKey] = { isCleared: true, cleanText: cleanText || targetKey };
             }
         }
-        await this.saveData(this.store);
+        this.invalidateSortCache();
+        this.requestSaveStore();
+    }
+
+    invalidateSortCache() {
+        this._cachedSortedFiles = null;
+    }
+
+    getSortedDailyFileEntries() {
+        if (this._cachedSortedFiles) return this._cachedSortedFiles;
+        if (!this.store.tasks) return [];
+
+        this._cachedSortedFiles = Object.keys(this.store.tasks)
+            .map(f => ({ name: f, date: parseNoteDateFlexible(f) }))
+            .filter(f => f.date.isValid())
+            .sort((a, b) => b.date.valueOf() - a.date.valueOf());
+
+        return this._cachedSortedFiles;
     }
 
     getTaskData(fileKey, taskText, context = {}) {
@@ -2341,30 +2742,28 @@ module.exports = class DailyTasksPlugin extends Plugin {
             }
         }
 
-        if (this.store.tasks) {
-            const sortedFiles = Object.keys(this.store.tasks)
-                .map(f => ({ name: f, date: parseNoteDateFlexible(f) }))
-                .filter(f => f.date.isValid() && f.date.isSameOrBefore(noteDate, 'day'))
-                .sort((a, b) => b.date.valueOf() - a.date.valueOf());
+        const sortedFiles = this.getSortedDailyFileEntries();
+        for (let i = 0; i < sortedFiles.length; i++) {
+            const item = sortedFiles[i];
+            if (item.date.isAfter(noteDate, 'day')) continue;
 
-            for (const item of sortedFiles) {
-                const map = this.store.tasks[item.name];
-                if (map) {
-                    const matched = matchTaskEntry(map, taskText, contextKey, context.ancestorTexts, context.childTexts);
-                    if (matched && !matched.isCleared) {
-                        const inherited = { ...matched };
-                        if (inherited.fromTracker && item.name !== fileKey) {
-                            return null;
-                        }
-                        if (inherited.repeat && /every\s+day|daily/i.test(inherited.repeat)) {
-                            const startDate = inherited.start ? window.moment(inherited.start, "YYYY-MM-DD") : null;
-                            if (!startDate || noteDate.isSameOrAfter(startDate, 'day')) {
-                                inherited.next = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
-                            }
-                        }
-                        this.saveTaskData(fileKey, contextKey || taskText, inherited);
-                        return inherited;
+            const map = this.store.tasks[item.name];
+            if (map) {
+                const matched = matchTaskEntry(map, taskText, contextKey, context.ancestorTexts, context.childTexts);
+                if (matched && !matched.isCleared) {
+                    const inherited = { ...matched };
+                    if (inherited.fromTracker && item.name !== fileKey) {
+                        return null;
                     }
+                    if (inherited.repeat && /every\s+day|daily/i.test(inherited.repeat)) {
+                        const startDate = inherited.start ? window.moment(inherited.start, "YYYY-MM-DD") : null;
+                        if (!startDate || noteDate.isSameOrAfter(startDate, 'day')) {
+                            inherited.next = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
+                        }
+                    }
+                    if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
+                    this.store.tasks[fileKey][contextKey || taskText] = inherited;
+                    return inherited;
                 }
             }
         }
@@ -2491,7 +2890,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
         for (const file of trackerFiles) {
             let content = "";
             try {
-                content = await this.app.vault.read(file);
+                content = await this.app.vault.cachedRead(file);
             } catch (e) {
                 continue;
             }
@@ -2728,6 +3127,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const finalToday = cleanFinalArray(todayTasks);
         const finalPlanned = cleanFinalArray(plannedTasks);
 
+        this.flushStore();
+
         return {
             todayTasks: finalToday.length > 0 ? finalToday.join("\n") : "- [ ] ",
             plannedTasks: finalPlanned.length > 0 ? finalPlanned.join("\n") : "- [ ] "
@@ -2766,7 +3167,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             return "- [ ] ";
         }
 
-        const content = await this.app.vault.read(prevFile);
+        const content = await this.app.vault.cachedRead(prevFile);
         const cache = this.app.metadataCache.getFileCache(prevFile);
         const lines = content.split("\n");
         const headings = cache ? cache.headings || [] : [];
