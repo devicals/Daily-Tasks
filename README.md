@@ -35,6 +35,10 @@ also before all the more like juicy things one small yet big thing it does is ca
 
 - added a purge button to purge all task schedules before a certain date or during a certain time period
 - added task tracker notes so you can plan tasks wthout cluttering up your daily notes
+- bug fixes:
+    - fixed import tasks from file not working by removing the settings option. just import from an existing file (before you click on the file)
+    - allows empty newlines in tasks for better organisation or readability ig
+    - fixed task tracker planned tasks and rollover conflicts
 
 
 # before i tell you how to use this here are some cool screenshots :)
