@@ -738,9 +738,9 @@ async function ensureHiddenTrackerStorage(plugin) {
 
 async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTracker = true) {
     const noteDate = isTracker ? window.moment() : parseNoteDateFlexible(sourceFileKey);
-    const lines = content.split("\n");
+    const normalizedContent = content.replace(/\r/g, "");
+    const lines = normalizedContent.split("\n");
     const lineCount = lines.length;
-    const tree = plugin.buildTaskTree(lines);
 
     const taskItems = [];
     for (let i = 0; i < lineCount; i++) {
@@ -759,11 +759,11 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
         const item = taskItems[i];
         if (!item.isTask && !item.isHeading) continue;
 
-        const match = item.text.match(/(?:::|\s::)\s*([^:\n]+)\s*::$/);
+        const match = item.text.match(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/);
         if (!match) continue;
 
         const rawTag = match[1].trim();
-        const cleanLine = item.text.replace(/(?:::|\s::)\s*([^:\n]+)\s*::$/, "").trimEnd();
+        const cleanLine = item.text.replace(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/, "").trimEnd();
         modifiedLines[i] = cleanLine;
 
         if (item.isHeading) {
@@ -846,7 +846,8 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
     }
 
     if (importedCount > 0) {
-        await plugin.saveData(plugin.store);
+        plugin.invalidateSortCache();
+        await plugin.flushStore();
     }
 
     return { importedCount, modifiedContent: modifiedLines.join("\n") };
@@ -1649,7 +1650,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const currentHeadings = [];
 
         for (let i = 0; i < lineCount; i++) {
-            const text = editor.getLine(i);
+            const text = editor.getLine(i).replace(/\r/g, "");
             if (/^\s*-\s*\[.\]/.test(text)) {
                 currentTasks.push({ line: i, clean: cleanTaskString(text) });
             } else if (/^#{1,6}\s+/.test(text)) {
@@ -1663,51 +1664,20 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const prevHeadings = prevSnapshot.headings || [];
 
             if (prevTasks.length === currentTasks.length) {
+                let diffCount = 0;
+                let oldT = null;
+                let newT = null;
+
                 for (let idx = 0; idx < currentTasks.length; idx++) {
-                    const prevT = prevTasks[idx];
-                    const currT = currentTasks[idx];
-                    if (prevT.line === currT.line && prevT.clean && currT.clean && prevT.clean !== currT.clean) {
-                        await this.renameTaskData(fileKey, prevT.clean, currT.clean);
-                    }
-                }
-            } else {
-                const matchedOld = new Set();
-                const matchedNew = new Set();
-
-                for (let o = 0; o < prevTasks.length; o++) {
-                    for (let n = 0; n < currentTasks.length; n++) {
-                        if (!matchedNew.has(n) && prevTasks[o].clean === currentTasks[n].clean) {
-                            matchedOld.add(o);
-                            matchedNew.add(n);
-                            break;
-                        }
+                    if (prevTasks[idx].clean !== currentTasks[idx].clean) {
+                        diffCount++;
+                        oldT = prevTasks[idx];
+                        newT = currentTasks[idx];
                     }
                 }
 
-                const unmatchedOld = prevTasks.map((t, i) => ({ ...t, idx: i })).filter(t => !matchedOld.has(t.idx));
-                const unmatchedNew = currentTasks.map((t, i) => ({ ...t, idx: i })).filter(t => !matchedNew.has(t.idx));
-
-                if (unmatchedOld.length === 1 && unmatchedNew.length === 1) {
-                    const oldClean = unmatchedOld[0].clean;
-                    const newClean = unmatchedNew[0].clean;
-                    if (oldClean && newClean && oldClean !== newClean) {
-                        await this.renameTaskData(fileKey, oldClean, newClean);
-                    }
-                } else if (unmatchedOld.length > 0 && unmatchedNew.length > 0) {
-                    for (const oldT of unmatchedOld) {
-                        let bestNew = null;
-                        let minDiff = Infinity;
-                        for (const newT of unmatchedNew) {
-                            const diff = Math.abs(oldT.line - newT.line);
-                            if (diff < minDiff) {
-                                minDiff = diff;
-                                bestNew = newT;
-                            }
-                        }
-                        if (bestNew && oldT.clean && bestNew.clean && oldT.clean !== bestNew.clean) {
-                            await this.renameTaskData(fileKey, oldT.clean, bestNew.clean);
-                        }
-                    }
+                if (diffCount === 1 && oldT && newT && oldT.clean && newT.clean) {
+                    await this.renameTaskData(fileKey, oldT.clean, newT.clean);
                 }
             }
 
@@ -2386,10 +2356,11 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const item = lines[i];
             if (!item.isTask && !item.isHeading) continue;
 
-            const match = item.text.match(/(?:::|\s::)\s*([^:\n]+)\s*::$/);
+            const cleanItemText = item.text.replace(/\r/g, "");
+            const match = cleanItemText.match(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/);
             if (match) {
                 const rawTag = match[1].trim();
-                const cleanLine = item.text.replace(/(?:::|\s::)\s*([^:\n]+)\s*::$/, "").trimEnd();
+                const cleanLine = cleanItemText.replace(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/, "").trimEnd();
 
                 let ancestorTexts = [];
                 let childTexts = [];
