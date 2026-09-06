@@ -466,11 +466,14 @@ function cleanTaskString(text) {
                .trim();
 }
 
-function computeTaskKey(cleanText, ancestorTexts = [], childTexts = []) {
+function computeTaskKey(cleanText, ancestorTexts = [], childTexts = [], dateStr = null) {
     if (!cleanText) return "";
     let key = cleanText;
     if (ancestorTexts && ancestorTexts.length > 0) {
         key = `${ancestorTexts.join(" > ")} > ${key}`;
+    }
+    if (dateStr) {
+        key = `${key} [due: ${dateStr}]`;
     }
     if (childTexts && childTexts.length > 0) {
         const childPreview = childTexts.filter(Boolean).slice(0, 3).join(" | ");
@@ -481,7 +484,7 @@ function computeTaskKey(cleanText, ancestorTexts = [], childTexts = []) {
     return key;
 }
 
-function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTexts = []) {
+function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTexts = [], targetDate = null) {
     if (!map) return null;
     if (contextKey && map[contextKey]) return map[contextKey];
 
@@ -493,20 +496,24 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
         if (entryClean !== cleanText && k !== cleanText && !k.endsWith(` > ${cleanText}`)) continue;
 
         let score = 0;
-        if (k === contextKey) score += 100;
+        if (k === contextKey) score += 1000;
+
+        if (targetDate && entry.next === targetDate) {
+            score += 200;
+        }
 
         if (entry.childTexts && childTexts && childTexts.length > 0) {
             const matchCount = entry.childTexts.filter(c => childTexts.includes(c)).length;
             if (matchCount > 0) {
-                score += matchCount * 30;
+                score += matchCount * 50;
             } else if (entry.childTexts.length > 0 && childTexts.length > 0) {
-                score -= 40;
+                score -= 100;
             }
         }
 
         if (entry.ancestorTexts && ancestorTexts && ancestorTexts.length > 0) {
             const matchCount = entry.ancestorTexts.filter(a => ancestorTexts.includes(a)).length;
-            score += matchCount * 20;
+            score += matchCount * 30;
         }
 
         if (score > maxScore) {
@@ -800,8 +807,9 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
         }
 
         const cleanText = cleanTaskString(cleanLine);
-        const taskKey = computeTaskKey(cleanText, ancestorTexts, childTexts);
         const parsed = parseTaskTag(rawTag, noteDate, null);
+        const nextStrTemp = parsed.explicitNextDate ? parsed.explicitNextDate.format("YYYY-MM-DD") : null;
+        const taskKey = computeTaskKey(cleanText, ancestorTexts, childTexts, nextStrTemp);
 
         if (!parsed.isClear) {
             let repeat = parsed.explicitRepeat;
@@ -2411,7 +2419,9 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     }
                 } else if (u.isTask) {
                     const cleanText = cleanTaskString(u.newText);
-                    const taskKey = computeTaskKey(cleanText, u.ancestorTexts, u.childTexts);
+                    const tempParsed = parseTaskTag(u.rawTag, noteDate, null);
+                    const tempNext = tempParsed.explicitNextDate ? tempParsed.explicitNextDate.format("YYYY-MM-DD") : null;
+                    const taskKey = computeTaskKey(cleanText, u.ancestorTexts, u.childTexts, tempNext);
                     const existing = this.getTaskData(fileKey, cleanText, { contextKey: taskKey, ancestorTexts: u.ancestorTexts, childTexts: u.childTexts }) || {};
                     const parsed = parseTaskTag(u.rawTag, noteDate, existing);
 
@@ -2696,10 +2706,10 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
     getTaskData(fileKey, taskText, context = {}) {
         const noteDate = parseNoteDateFlexible(fileKey);
-        const contextKey = context.contextKey || computeTaskKey(taskText, context.ancestorTexts, context.childTexts);
+        const contextKey = context.contextKey || computeTaskKey(taskText, context.ancestorTexts, context.childTexts, context.dateStr);
 
         if (this.store.tasks && this.store.tasks[fileKey]) {
-            const currentData = matchTaskEntry(this.store.tasks[fileKey], taskText, contextKey, context.ancestorTexts, context.childTexts);
+            const currentData = matchTaskEntry(this.store.tasks[fileKey], taskText, contextKey, context.ancestorTexts, context.childTexts, context.dateStr);
             if (currentData) {
                 if (currentData.isCleared) return null;
                 if (currentData.repeat && /every\s+day|daily/i.test(currentData.repeat)) {
@@ -2720,7 +2730,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
             const map = this.store.tasks[item.name];
             if (map) {
-                const matched = matchTaskEntry(map, taskText, contextKey, context.ancestorTexts, context.childTexts);
+                const matched = matchTaskEntry(map, taskText, contextKey, context.ancestorTexts, context.childTexts, context.dateStr);
                 if (matched && !matched.isCleared) {
                     const inherited = { ...matched };
                     if (inherited.fromTracker && item.name !== fileKey) {
