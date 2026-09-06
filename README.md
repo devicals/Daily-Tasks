@@ -33,6 +33,8 @@ also before all the more like juicy things one small yet big thing it does is ca
 
 # WHAT'S NEW??
 
+- added every multiple days (e.g. every saturday and sunday) functionality
+- polished repeating periods (starting ... until)
 - bug fixes:
     - fixed another import tasks from file bug where it just thinks theres no unimported tasks even tho there is
 
