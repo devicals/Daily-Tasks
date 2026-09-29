@@ -23,7 +23,7 @@ const WEEKDAYS = {
 
 function normalizeNaturalText(str) {
     let s = str.toLowerCase()
-        .replace(/[\,\.]/g, " ")
+        .replace(/[\,]/g, " ")
         .replace(/\b(\d+)(st|nd|rd|th)\b/g, "$1")
         .replace(/\b(st|nd|rd|th)\b/g, " ")
         .replace(/\bof\b/g, " ");
@@ -137,7 +137,7 @@ function getWeekdayDate(baseDate, targetDayNum, modifier) {
 
 function parseNaturalDate(rawStr, baseDate) {
     if (!rawStr) return null;
-    const s = normalizeNaturalText(rawStr).replace(/-/g, " ").trim();
+    const s = normalizeNaturalText(rawStr).trim();
 
     if (/\b(?:today|tonight)\b/i.test(s)) {
         return { date: baseDate.clone(), hasYear: true };
@@ -150,9 +150,12 @@ function parseNaturalDate(rawStr, baseDate) {
     }
 
     const formats = [
-        "DD/MM/YYYY", "DD-MM-YYYY", "YYYY-MM-DD", "YYYY/MM/DD",
+        "DD/MM/YYYY", "D/M/YYYY", "DD-MM-YYYY", "D-M-YYYY", "D.M.YYYY", "DD.MM.YYYY",
+        "YYYY-MM-DD", "YYYY-M-D", "YYYY/MM/DD", "YYYY/M/D", "YYYY.MM.DD", "YYYY.M.D",
+        "D M YYYY", "DD MM YYYY", "YYYY M D", "YYYY MM DD",
         "D MMMM YYYY", "D MMM YYYY", "MMMM D YYYY", "MMM D YYYY",
-        "DD/MM", "DD-MM", "D MMMM", "D MMM", "MMMM D", "MMM D"
+        "DD/MM", "D/M", "DD-MM", "D-M", "D.M", "DD.MM", "D M", "DD MM",
+        "D MMMM", "D MMM", "MMMM D", "MMM D"
     ];
 
     for (const f of formats) {
@@ -460,6 +463,7 @@ function formatCompoundRelativeDiff(targetDate, baseDate) {
 }
 
 function cleanTaskString(text) {
+    if (!text) return "";
     return text.replace(/^\s*-\s*\[.\]\s*/, "")
                .replace(/\[(?:<span[^>]*>)?[\?\#\°](?:\s*<\/span>)?\]\{[\s\S]*?\}\s*/g, "")
                .replace(/\{#\|[^}]+\}\s*/g, "")
@@ -467,6 +471,8 @@ function cleanTaskString(text) {
                .replace(/%%[\s\S]*?%%/g, "")
                .replace(/%[^\n]*/g, "")
                .replace(/^#\s+/, "")
+               .replace(/\s*\[due:\s*[^\]]+\]/gi, "")
+               .replace(/\s*\[sub:\s*[^\]]+\]/gi, "")
                .replace(/\s+/g, " ")
                .trim();
 }
@@ -491,20 +497,32 @@ function computeTaskKey(cleanText, ancestorTexts = [], childTexts = [], dateStr 
 
 function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTexts = [], targetDate = null) {
     if (!map) return null;
-    if (contextKey && map[contextKey]) return map[contextKey];
 
     let bestEntry = null;
     let maxScore = -1;
 
     for (const [k, entry] of Object.entries(map)) {
+        if (!entry) continue;
         const entryClean = entry.cleanText || cleanTaskString(k);
-        if (entryClean !== cleanText && k !== cleanText && !k.endsWith(` > ${cleanText}`)) continue;
+        const kWithoutPrefix = k.includes(" > ") ? k.split(" > ").pop().trim() : k;
+        const kClean = cleanTaskString(kWithoutPrefix);
+
+        if (entryClean !== cleanText && kClean !== cleanText && k !== cleanText && !k.endsWith(` > ${cleanText}`)) continue;
 
         let score = 0;
         if (k === contextKey) score += 1000;
+        else if (kClean === cleanText) score += 500;
 
         if (targetDate && entry.next === targetDate) {
             score += 200;
+        }
+
+        if (entry.repeat || entry.next || entry.orig || entry.start || entry.until) {
+            score += 300;
+        }
+
+        if (entry.isCleared) {
+            score -= 2000;
         }
 
         if (entry.childTexts && childTexts && childTexts.length > 0) {
@@ -528,10 +546,9 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
     }
 
     if (bestEntry && maxScore >= 0) return bestEntry;
-    if (map[cleanText] && (!map[cleanText].contextKey || map[cleanText].contextKey === cleanText)) {
-        return map[cleanText];
-    }
-    return bestEntry || map[cleanText] || null;
+    if (contextKey && map[contextKey] && !map[contextKey].isCleared) return map[contextKey];
+    if (map[cleanText] && !map[cleanText].isCleared) return map[cleanText];
+    return null;
 }
 
 function cleanHeadingString(text) {
@@ -669,7 +686,7 @@ function isPeriodicOrDailyNote(file, app, folderOverride) {
             }
         }
     }
-    return false;
+    return !folderOverride && !!parseNoteDateStrict(baseName);
 }
 
 function isDailyNoteFile(file, app, folderOverride) {
@@ -680,7 +697,7 @@ function isDailyNoteFile(file, app, folderOverride) {
 
     if (folderOverride) {
         const folder = folderOverride.replace(/^\/|\/$/g, "");
-        if (folder && fileFolder === folder && parseNoteDateStrict(baseName)) return true;
+        return folder === fileFolder && !!parseNoteDateStrict(baseName);
     }
 
     const dailyCore = app.internalPlugins?.plugins?.["daily-notes"];
@@ -800,7 +817,7 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
         const cleanText = cleanTaskString(cleanLine);
         const parsed = parseTaskTag(rawTag, noteDate, null);
         const nextStrTemp = parsed.explicitNextDate ? parsed.explicitNextDate.format("YYYY-MM-DD") : null;
-        const taskKey = computeTaskKey(cleanText, ancestorTexts, childTexts, nextStrTemp);
+        const taskKey = computeTaskKey(cleanText, ancestorTexts, childTexts, isTracker ? nextStrTemp : null);
 
         if (!parsed.isClear) {
             let repeat = parsed.explicitRepeat;
