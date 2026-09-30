@@ -879,7 +879,7 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
                 until,
                 isOptional,
                 streak: 0,
-                weekdays: parsed.explicitWeekdays || null, // <-- ADD THIS
+                weekdays: parsed.explicitWeekdays || null,
                 rawTag,
                 fromTracker: isTracker ? sourceFileKey : null
             };
@@ -2115,7 +2115,6 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         const trackerDueItems = await this.getTrackerDueTasksForDate(currentNoteTitle);
 
-        // Build case-insensitive multimap of tracker items due today
         const trackerReplacementMap = new Map();
         for (let i = 0; i < trackerDueItems.length; i++) {
             const item = trackerDueItems[i];
@@ -2171,8 +2170,6 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 data = extractLegacyBadgeInfo(rawLine, prevNoteDate);
             }
 
-            // In-place replacement: if today has a scheduled tracker item with this name (e.g. Euka),
-            // today's tracker item replaces yesterday's block in-place regardless of completion.
             if (trackerReplacementMap.has(lowerClean) && trackerReplacementMap.get(lowerClean).length > 0) {
                 const replacement = trackerReplacementMap.get(lowerClean).shift();
                 pushWithBlankHandling(todayTasks, replacement.lines);
@@ -2181,23 +2178,19 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 continue;
             }
 
-            // Drop old/duplicate tracker blocks from previous days
             const weekdays = getWeekdaysFromData(data);
             if (data && data.fromTracker) {
-                // If it repeats, was completed, or this tracker parent was already satisfied today, do not roll over
                 if (data.repeat || (weekdays && weekdays.length > 0) || isChecked || seenCleanTexts.has(lowerClean)) {
                     continue;
                 }
             }
 
-            // Completed non-recurring tasks must never roll over
             if (isChecked && (!data || (!data.repeat && (!weekdays || weekdays.length === 0)))) {
                 continue;
             }
 
             const processedTree = this.filterTreeBySchedule(rootItem, currentNoteTitle, prevNoteTitle, null, []);
 
-            // Untagged tasks: roll over only if incomplete
             if (!data || data.isCleared) {
                 if (!isChecked) {
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, false));
@@ -2316,7 +2309,6 @@ module.exports = class DailyTasksPlugin extends Plugin {
             }
         }
 
-        // Append any tracker items due today that were not already inserted in-place
         for (const [key, items] of trackerReplacementMap.entries()) {
             for (let i = 0; i < items.length; i++) {
                 const item = items[i];

@@ -34,7 +34,7 @@ also before all the more like juicy things one small yet big thing it does is ca
 # WHAT'S NEW??
 
 - bug fixes:
-    - fixed for some reason everything broke so happy now
+    - fixed rollovers breaking and shi
 
 
 # before i tell you how to use this here are some cool screenshots :)
