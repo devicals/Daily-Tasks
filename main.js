@@ -184,6 +184,26 @@ function parseNaturalDate(rawStr, baseDate) {
     return null;
 }
 
+function getWeekdaysFromData(data) {
+    if (!data) return null;
+    if (data.weekdays && Array.isArray(data.weekdays) && data.weekdays.length > 0) {
+        return data.weekdays;
+    }
+    const text = ((data.repeat || "") + " " + (data.rawTag || "")).toLowerCase();
+    const s = normalizeNaturalText(text);
+    if (/\b(?:weekdays?|workdays?)\b/.test(s)) return [1, 2, 3, 4, 5];
+    if (/\b(?:weekends?)\b/.test(s)) return [0, 6];
+
+    const detected = [];
+    for (const word of s.split(/[\s,]+/)) {
+        const clean = word.replace(/[^a-z]/g, "");
+        if (WEEKDAYS[clean] !== undefined && !detected.includes(WEEKDAYS[clean])) {
+            detected.push(WEEKDAYS[clean]);
+        }
+    }
+    return detected.length > 0 ? detected : null;
+}
+
 function formatRepeatUnits(interval) {
     const nonZero = (interval.days > 0 ? 1 : 0) + (interval.weeks > 0 ? 1 : 0) + (interval.months > 0 ? 1 : 0) + (interval.years > 0 ? 1 : 0);
     if (nonZero === 1) {
@@ -612,6 +632,7 @@ function parseNoteDateFlexible(name) {
     const clean = name.replace(/\[|\]/g, "").trim();
     const formats = [
         "Do [of] MMM, YYYY", "Do of MMM, YYYY", "D MMM YYYY", "Do MMMM YYYY",
+        "Do [of] MMMM, YYYY", "Do of MMMM, YYYY", "Do [of] MMMM YYYY",
         "YYYY-MM-DD", "DD-MM-YYYY", "YYYY/MM/DD", "MM-DD-YYYY"
     ];
     for (const f of formats) {
@@ -637,6 +658,7 @@ function parseNoteDateStrict(name) {
     const clean = name.replace(/\[|\]/g, "").trim();
     const formats = [
         "Do [of] MMM, YYYY", "Do of MMM, YYYY", "D MMM YYYY", "Do MMMM YYYY",
+        "Do [of] MMMM, YYYY", "Do of MMMM, YYYY", "Do [of] MMMM YYYY",
         "YYYY-MM-DD", "DD-MM-YYYY", "YYYY/MM/DD", "MM-DD-YYYY"
     ];
     for (const f of formats) {
@@ -697,7 +719,10 @@ function isDailyNoteFile(file, app, folderOverride) {
 
     if (folderOverride) {
         const folder = folderOverride.replace(/^\/|\/$/g, "");
-        return folder === fileFolder && !!parseNoteDateStrict(baseName);
+        const folderExists = !!app.vault.getAbstractFileByPath(folder);
+        if (folderExists) {
+            return folder === fileFolder && !!parseNoteDateStrict(baseName);
+        }
     }
 
     const dailyCore = app.internalPlugins?.plugins?.["daily-notes"];
@@ -854,6 +879,7 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
                 until,
                 isOptional,
                 streak: 0,
+                weekdays: parsed.explicitWeekdays || null, // <-- ADD THIS
                 rawTag,
                 fromTracker: isTracker ? sourceFileKey : null
             };
@@ -1420,12 +1446,18 @@ class TasksTemplateApi {
     }
 
     async now(tp) {
-        const title = (tp && tp.file && typeof tp.file.title === "string") ? tp.file.title : undefined;
+        let title = tp;
+        if (tp && typeof tp === "object") {
+            title = tp.file?.title || tp.title || undefined;
+        }
         return await this.plugin.getRolloverContent("tasks", title).catch(() => "- [ ] ");
     }
 
     async planned(tp) {
-        const title = (tp && tp.file && typeof tp.file.title === "string") ? tp.file.title : undefined;
+        let title = tp;
+        if (tp && typeof tp === "object") {
+            title = tp.file?.title || tp.title || undefined;
+        }
         return await this.plugin.getRolloverContent("plan", title).catch(() => "- [ ] ");
     }
 }
@@ -2039,22 +2071,21 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
                     const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
                     const nextDate = data.next ? window.moment(data.next, "YYYY-MM-DD") : null;
+                    const weekdays = getWeekdaysFromData(data);
 
                     if (untilDate && noteDate.isAfter(untilDate, 'day')) {
                         isDue = false;
                     } else if (startDate && noteDate.isBefore(startDate, 'day')) {
                         isDue = false;
-                    } else if (data.weekdays && Array.isArray(data.weekdays) && data.weekdays.length > 0) {
-                        isDue = data.weekdays.includes(noteDate.day());
+                    } else if (weekdays && weekdays.length > 0) {
+                        isDue = weekdays.includes(noteDate.day());
                     } else if (data.repeat) {
                         const interval = parseInterval(data.repeat);
                         const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years;
                         if (isDaily) {
                             isDue = true;
                         } else if (nextDate) {
-                            isDue = nextDate.isSameOrBefore(noteDate, 'day');
-                        } else {
-                            isDue = true;
+                            isDue = nextDate.isSame(noteDate, 'day');
                         }
                     } else {
                         if (startDate && untilDate) {
@@ -2078,21 +2109,27 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         return dueItems;
     }
-
     async evaluateRollover(prevNoteTitle, currentNoteTitle, prevLines) {
         const prevNoteDate = parseNoteDateFlexible(prevNoteTitle);
         const noteDate = parseNoteDateFlexible(currentNoteTitle);
 
         const trackerDueItems = await this.getTrackerDueTasksForDate(currentNoteTitle);
+
+        // Build case-insensitive multimap of tracker items due today
         const trackerReplacementMap = new Map();
         for (let i = 0; i < trackerDueItems.length; i++) {
             const item = trackerDueItems[i];
-            trackerReplacementMap.set(item.cleanText, item);
+            const key = item.cleanText.toLowerCase();
+            if (!trackerReplacementMap.has(key)) {
+                trackerReplacementMap.set(key, []);
+            }
+            trackerReplacementMap.get(key).push(item);
         }
 
         const tree = this.buildTaskTree(prevLines);
         const todayTasks = [];
         const plannedTasks = [];
+        const seenContextKeys = new Set();
         const seenCleanTexts = new Set();
 
         const pushWithBlankHandling = (targetArray, lines) => {
@@ -2124,29 +2161,48 @@ module.exports = class DailyTasksPlugin extends Plugin {
             if (!rootItem.isTask) continue;
 
             const cleanText = cleanTaskString(rawLine);
+            const lowerClean = cleanText.toLowerCase();
             const childTexts = rootItem.children.map(c => cleanTaskString(c.raw));
             const contextKey = computeTaskKey(cleanText, [], childTexts);
-
-            if (trackerReplacementMap.has(cleanText)) {
-                const replacement = trackerReplacementMap.get(cleanText);
-                pushWithBlankHandling(todayTasks, replacement.lines);
-                seenCleanTexts.add(cleanText);
-                trackerReplacementMap.delete(cleanText);
-                continue;
-            }
+            const isChecked = /^\s*-\s*\[x\]/i.test(rawLine);
 
             let data = this.getTaskData(prevNoteTitle, cleanText, { contextKey, childTexts });
             if (!data) {
                 data = extractLegacyBadgeInfo(rawLine, prevNoteDate);
             }
 
-            const processedTree = this.filterTreeBySchedule(rootItem, currentNoteTitle, prevNoteTitle, null, []);
-            const isChecked = /^\s*-\s*\[x\]/i.test(rawLine);
+            // In-place replacement: if today has a scheduled tracker item with this name (e.g. Euka),
+            // today's tracker item replaces yesterday's block in-place regardless of completion.
+            if (trackerReplacementMap.has(lowerClean) && trackerReplacementMap.get(lowerClean).length > 0) {
+                const replacement = trackerReplacementMap.get(lowerClean).shift();
+                pushWithBlankHandling(todayTasks, replacement.lines);
+                seenContextKeys.add(replacement.contextKey);
+                seenCleanTexts.add(lowerClean);
+                continue;
+            }
 
+            // Drop old/duplicate tracker blocks from previous days
+            const weekdays = getWeekdaysFromData(data);
+            if (data && data.fromTracker) {
+                // If it repeats, was completed, or this tracker parent was already satisfied today, do not roll over
+                if (data.repeat || (weekdays && weekdays.length > 0) || isChecked || seenCleanTexts.has(lowerClean)) {
+                    continue;
+                }
+            }
+
+            // Completed non-recurring tasks must never roll over
+            if (isChecked && (!data || (!data.repeat && (!weekdays || weekdays.length === 0)))) {
+                continue;
+            }
+
+            const processedTree = this.filterTreeBySchedule(rootItem, currentNoteTitle, prevNoteTitle, null, []);
+
+            // Untagged tasks: roll over only if incomplete
             if (!data || data.isCleared) {
                 if (!isChecked) {
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, false));
-                    seenCleanTexts.add(cleanText);
+                    seenContextKeys.add(contextKey);
+                    seenCleanTexts.add(lowerClean);
                 }
                 continue;
             }
@@ -2168,49 +2224,55 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 continue;
             }
 
-            const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years && !data.weekdays;
-
-            if (isDaily) {
-                const newStreak = isChecked ? (data.streak || 0) + 1 : 0;
-                pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
-                seenCleanTexts.add(cleanText);
-                this.saveTaskData(currentNoteTitle, contextKey, {
-                    ...data,
-                    next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD"),
-                    streak: newStreak
-                });
-                continue;
-            }
-
-            if (data.weekdays && data.weekdays.length > 0) {
-                const isDueToday = data.weekdays.includes(noteDate.day());
+            if (weekdays && weekdays.length > 0) {
+                const isDueToday = weekdays.includes(noteDate.day());
                 if (isDueToday) {
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
-                    seenCleanTexts.add(cleanText);
-                    const nextMatching = getNextMatchingWeekdayDate(noteDate.clone().add(1, 'days'), data.weekdays, startDate);
+                    seenContextKeys.add(contextKey);
+                    seenCleanTexts.add(lowerClean);
+                    const nextMatching = getNextMatchingWeekdayDate(noteDate.clone().add(1, 'days'), weekdays, startDate);
                     this.saveTaskData(currentNoteTitle, contextKey, {
                         ...data,
+                        weekdays,
                         next: nextMatching.format("YYYY-MM-DD")
                     });
                 } else {
                     if (!data.fromTracker) {
                         pushWithBlankHandling(plannedTasks, this.formatTaskTree(processedTree, true));
                     }
-                    this.saveTaskData(currentNoteTitle, contextKey, data);
+                    this.saveTaskData(currentNoteTitle, contextKey, {
+                        ...data,
+                        weekdays
+                    });
                 }
                 continue;
             }
 
-            if (untilDate) {
-                if (noteDate.isSameOrAfter(startDate || prevNoteDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day')) {
+            if (untilDate && startDate) {
+                if (noteDate.isSameOrAfter(startDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day')) {
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
-                    seenCleanTexts.add(cleanText);
+                    seenContextKeys.add(contextKey);
+                    seenCleanTexts.add(lowerClean);
                     this.saveTaskData(currentNoteTitle, contextKey, {
                         ...data,
                         next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD")
                     });
                     continue;
                 }
+            }
+
+            const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years;
+            if (isDaily) {
+                const newStreak = isChecked ? (data.streak || 0) + 1 : 0;
+                pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
+                seenContextKeys.add(contextKey);
+                seenCleanTexts.add(lowerClean);
+                this.saveTaskData(currentNoteTitle, contextKey, {
+                    ...data,
+                    next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD"),
+                    streak: newStreak
+                });
+                continue;
             }
 
             if (!targetDate && interval) {
@@ -2220,8 +2282,12 @@ module.exports = class DailyTasksPlugin extends Plugin {
             if (targetDate) {
                 const isDueToday = targetDate.isSameOrBefore(noteDate, 'day');
                 if (isDueToday) {
+                    if (!interval && isChecked) {
+                        continue;
+                    }
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
-                    seenCleanTexts.add(cleanText);
+                    seenContextKeys.add(contextKey);
+                    seenCleanTexts.add(lowerClean);
                     if (interval) {
                         const nextAfterToday = addToDate(noteDate, interval);
                         this.saveTaskData(currentNoteTitle, contextKey, {
@@ -2243,19 +2309,25 @@ module.exports = class DailyTasksPlugin extends Plugin {
             } else {
                 if (!isChecked) {
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, false));
-                    seenCleanTexts.add(cleanText);
+                    seenContextKeys.add(contextKey);
+                    seenCleanTexts.add(lowerClean);
                     this.saveTaskData(currentNoteTitle, contextKey, data);
                 }
             }
         }
 
-        for (const [_, item] of trackerReplacementMap) {
-            if (!seenCleanTexts.has(item.cleanText)) {
-                if (todayTasks.length > 0 && todayTasks[todayTasks.length - 1] !== "") {
-                    todayTasks.push("");
+        // Append any tracker items due today that were not already inserted in-place
+        for (const [key, items] of trackerReplacementMap.entries()) {
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                if (!seenContextKeys.has(item.contextKey)) {
+                    if (todayTasks.length > 0 && todayTasks[todayTasks.length - 1] !== "") {
+                        todayTasks.push("");
+                    }
+                    pushWithBlankHandling(todayTasks, item.lines);
+                    seenContextKeys.add(item.contextKey);
+                    seenCleanTexts.add(item.cleanText.toLowerCase());
                 }
-                pushWithBlankHandling(todayTasks, item.lines);
-                seenCleanTexts.add(item.cleanText);
             }
         }
 
