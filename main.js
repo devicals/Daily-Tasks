@@ -21,6 +21,16 @@ const WEEKDAYS = {
     "saturday": 6, "sat": 6, "saturdays": 6
 };
 
+function normalizeForMatching(text) {
+    if (!text) return "";
+    return text.replace(/\[([^\]]+)\]\([^\)]*\)/g, "$1")
+               .replace(/\[\[(?:[^\]\|]*\|)?([^\]]+)\]\]/g, "$1")
+               .replace(/[\*_~`]/g, "")
+               .replace(/\s+/g, " ")
+               .trim()
+               .toLowerCase();
+}
+
 function normalizeNaturalText(str) {
     let s = str.toLowerCase()
         .replace(/[\,]/g, " ")
@@ -152,9 +162,11 @@ function parseNaturalDate(rawStr, baseDate) {
     const formats = [
         "DD/MM/YYYY", "D/M/YYYY", "DD-MM-YYYY", "D-M-YYYY", "D.M.YYYY", "DD.MM.YYYY",
         "YYYY-MM-DD", "YYYY-M-D", "YYYY/MM/DD", "YYYY/M/D", "YYYY.MM.DD", "YYYY.M.D",
+        "MM/DD/YYYY", "M/D/YYYY", "MM-DD-YYYY", "M-D-YYYY",
         "D M YYYY", "DD MM YYYY", "YYYY M D", "YYYY MM DD",
         "D MMMM YYYY", "D MMM YYYY", "MMMM D YYYY", "MMM D YYYY",
         "DD/MM", "D/M", "DD-MM", "D-M", "D.M", "DD.MM", "D M", "DD MM",
+        "MM/DD", "M/D", "MM-DD", "M-D",
         "D MMMM", "D MMM", "MMMM D", "MMM D"
     ];
 
@@ -188,6 +200,9 @@ function getWeekdaysFromData(data) {
     if (!data) return null;
     if (data.weekdays && Array.isArray(data.weekdays) && data.weekdays.length > 0) {
         return data.weekdays;
+    }
+    if (!data.repeat && !/\b(?:every|each|repeat|recurring|repeating)\b/i.test(data.rawTag || "")) {
+        return null;
     }
     const text = ((data.repeat || "") + " " + (data.rawTag || "")).toLowerCase();
     const s = normalizeNaturalText(text);
@@ -238,7 +253,7 @@ function getNextMatchingWeekdayDate(baseDate, daysArray, startDate = null) {
 
 function parseTaskTag(tagRaw, baseDate, existingData = null) {
     const raw = tagRaw.trim();
-    if (/^(clear|remove|delete|none|reset)$/i.test(raw)) {
+    if (/^(clear|remove|delete|none|reset|cancel|stop)(\s+(schedule|task|repeat|recurrence|all))?$|^no\s+(schedule|repeat|recurrence)$/i.test(raw)) {
         return { isClear: true };
     }
 
@@ -286,7 +301,53 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
             continue;
         }
 
-        const untilMatch = segLower.match(/\b(?:until|til|till|thru|through|up\s*to)\s+([0-9\/\-\.a-z\s]+)$/i);
+        const recurRangeMatch = segLower.match(/^(.+?)\s+(?:from|in|starting\s+from|starting)\s+(.+?)\s+(?:to|until|til|till|thru|through|up\s*to|-)\s+(.+)$/i);
+        if (recurRangeMatch) {
+            const rStart = parseNaturalDate(recurRangeMatch[2].trim(), baseDate);
+            const rEnd = parseNaturalDate(recurRangeMatch[3].trim(), baseDate);
+            if (rStart && rEnd) {
+                explicitStartDate = rStart.date.clone();
+                explicitUntilDate = rEnd.date.clone();
+                if (explicitUntilDate.isBefore(explicitStartDate, 'day') && !rEnd.hasYear) {
+                    explicitUntilDate.add(1, 'year');
+                }
+                segLower = recurRangeMatch[1].trim();
+            }
+        }
+
+        let rangeMatch = segLower.match(/^(?:(?:from|in|starting\s+from|starting)\s+)?(.+?)\s+(?:to|until|til|till|thru|through|up\s*to|-)\s+(.+)$/i);
+        if (!rangeMatch) {
+            rangeMatch = segLower.match(/^between\s+(.+?)\s+(?:and|to)\s+(.+)$/i);
+        }
+
+        if (rangeMatch) {
+            const rawStart = rangeMatch[1].trim();
+            const rawEnd = rangeMatch[2].trim();
+            const parsedStart = parseNaturalDate(rawStart, baseDate);
+            const parsedEnd = parseNaturalDate(rawEnd, baseDate);
+
+            if (parsedStart && parsedEnd) {
+                explicitStartDate = parsedStart.date.clone();
+                explicitUntilDate = parsedEnd.date.clone();
+
+                if (explicitUntilDate.isBefore(explicitStartDate, 'day')) {
+                    if (!parsedEnd.hasYear) {
+                        explicitUntilDate.add(1, 'year');
+                    } else if (!parsedStart.hasYear) {
+                        explicitStartDate.subtract(1, 'year');
+                    }
+                }
+
+                if (baseDate.isSameOrAfter(explicitStartDate, 'day') && baseDate.isSameOrBefore(explicitUntilDate, 'day')) {
+                    explicitNextDate = baseDate.clone();
+                } else {
+                    explicitNextDate = explicitStartDate.clone();
+                }
+                continue;
+            }
+        }
+
+        const untilMatch = segLower.match(/\b(?:until|til|till|thru|through|up\s*to|to|due|by)\s+([0-9\/\-\.a-z\s]+)$/i);
         if (untilMatch) {
             const uStr = untilMatch[1].trim();
             const parsedU = parseNaturalDate(uStr, baseDate);
@@ -420,7 +481,11 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
     }
 
     if (explicitStartDate && (!explicitNextDate || explicitNextDate.isBefore(explicitStartDate, 'day'))) {
-        explicitNextDate = explicitStartDate.clone();
+        if (explicitUntilDate && baseDate.isSameOrAfter(explicitStartDate, 'day') && baseDate.isSameOrBefore(explicitUntilDate, 'day')) {
+            explicitNextDate = baseDate.clone();
+        } else {
+            explicitNextDate = explicitStartDate.clone();
+        }
     }
 
     return {
@@ -520,6 +585,9 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
 
     let bestEntry = null;
     let maxScore = -1;
+    let clearedMatch = null;
+
+    const targetNorm = normalizeForMatching(cleanText);
 
     for (const [k, entry] of Object.entries(map)) {
         if (!entry) continue;
@@ -527,7 +595,19 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
         const kWithoutPrefix = k.includes(" > ") ? k.split(" > ").pop().trim() : k;
         const kClean = cleanTaskString(kWithoutPrefix);
 
-        if (entryClean !== cleanText && kClean !== cleanText && k !== cleanText && !k.endsWith(` > ${cleanText}`)) continue;
+        const isMatch = entryClean === cleanText ||
+                        kClean === cleanText ||
+                        k === cleanText ||
+                        k.endsWith(` > ${cleanText}`) ||
+                        normalizeForMatching(entryClean) === targetNorm ||
+                        normalizeForMatching(kClean) === targetNorm;
+
+        if (!isMatch) continue;
+
+        if (entry.isCleared) {
+            clearedMatch = entry;
+            continue;
+        }
 
         let score = 0;
         if (k === contextKey) score += 1000;
@@ -539,10 +619,6 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
 
         if (entry.repeat || entry.next || entry.orig || entry.start || entry.until) {
             score += 300;
-        }
-
-        if (entry.isCleared) {
-            score -= 2000;
         }
 
         if (entry.childTexts && childTexts && childTexts.length > 0) {
@@ -566,8 +642,9 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
     }
 
     if (bestEntry && maxScore >= 0) return bestEntry;
-    if (contextKey && map[contextKey] && !map[contextKey].isCleared) return map[contextKey];
-    if (map[cleanText] && !map[cleanText].isCleared) return map[cleanText];
+    if (clearedMatch) return clearedMatch;
+    if (contextKey && map[contextKey]) return map[contextKey];
+    if (map[cleanText]) return map[cleanText];
     return null;
 }
 
@@ -758,6 +835,12 @@ function collectDomAncestorTaskTexts(container) {
 function isTaskOverdue(data, noteDate) {
     if (!data || !data.next) return false;
     if (data.repeat && /every\s+day|daily/i.test(data.repeat)) return false;
+    if (data.start && data.until) {
+        const untilM = window.moment(data.until, "YYYY-MM-DD");
+        if (untilM.isValid()) {
+            return noteDate.isAfter(untilM, 'day');
+        }
+    }
     const nextM = window.moment(data.next, "YYYY-MM-DD");
     return nextM.isValid() && nextM.isBefore(noteDate, 'day');
 }
@@ -1483,6 +1566,30 @@ module.exports = class DailyTasksPlugin extends Plugin {
         window.tasks = this.tasksApi;
         window.TaskSchedulerAPI = this;
 
+        if (this.store && this.store.tasks) {
+            let repaired = false;
+            for (const fileKey of Object.keys(this.store.tasks)) {
+                const noteDate = parseNoteDateFlexible(fileKey);
+                for (const tKey of Object.keys(this.store.tasks[fileKey])) {
+                    const t = this.store.tasks[fileKey][tKey];
+                    if (t && t.rawTag && (!t.start || !t.until || !t.next)) {
+                        if (/\b(?:from|to|until|thru|through)\b/i.test(t.rawTag)) {
+                            const parsed = parseTaskTag(t.rawTag, noteDate, t);
+                            if (parsed.explicitStartDate || parsed.explicitUntilDate || parsed.explicitNextDate) {
+                                if (parsed.explicitStartDate) t.start = parsed.explicitStartDate.format("YYYY-MM-DD");
+                                if (parsed.explicitUntilDate) t.until = parsed.explicitUntilDate.format("YYYY-MM-DD");
+                                if (parsed.explicitNextDate) t.next = parsed.explicitNextDate.format("YYYY-MM-DD");
+                                repaired = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (repaired) {
+                await this.saveData(this.store);
+            }
+        }
+
         this.addSettingTab(new DailyTasksSettingTab(this.app, this));
 
         const templaterEnabled = !!this.app.plugins?.plugins?.["templater-obsidian"];
@@ -1748,17 +1855,30 @@ module.exports = class DailyTasksPlugin extends Plugin {
         if (!oldTaskText || !newTaskText || oldTaskText === newTaskText) return;
         let existingData = null;
 
-        if (this.store.tasks && this.store.tasks[fileKey] && this.store.tasks[fileKey][oldTaskText]) {
-            existingData = this.store.tasks[fileKey][oldTaskText];
-            delete this.store.tasks[fileKey][oldTaskText];
-        } else {
+        if (this.store.tasks && this.store.tasks[fileKey]) {
+            const oldCleanNorm = normalizeForMatching(oldTaskText);
+            for (const k of Object.keys(this.store.tasks[fileKey])) {
+                const entry = this.store.tasks[fileKey][k];
+                const entryClean = entry?.cleanText || cleanTaskString(k);
+                if (k === oldTaskText || entryClean === oldTaskText || normalizeForMatching(entryClean) === oldCleanNorm) {
+                    if (!existingData) existingData = entry;
+                    delete this.store.tasks[fileKey][k];
+                }
+            }
+        }
+
+        if (!existingData) {
             existingData = this.getTaskData(fileKey, oldTaskText);
         }
 
         if (existingData) {
             if (!this.store.tasks) this.store.tasks = {};
             if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
-            this.store.tasks[fileKey][newTaskText] = existingData;
+            this.store.tasks[fileKey][newTaskText] = {
+                ...existingData,
+                cleanText: newTaskText,
+                contextKey: newTaskText
+            };
             await this.saveData(this.store);
         }
     }
@@ -1840,6 +1960,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             for (const line of lines) {
                 if (/^\s*-\s*\[.\]/.test(line)) {
                     existingTaskTexts.add(cleanTaskString(line));
+                    existingTaskTexts.add(normalizeForMatching(cleanTaskString(line)));
                 }
                 if (/^#{1,6}\s+/.test(line)) {
                     existingHeadings.add(cleanHeadingString(line).toLowerCase());
@@ -1850,7 +1971,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
             if (taskEntries) {
                 for (const taskKey of Object.keys(taskEntries)) {
                     const clean = taskEntries[taskKey].cleanText || cleanTaskString(taskKey);
-                    if (!existingTaskTexts.has(clean)) {
+                    const cleanNorm = normalizeForMatching(clean);
+                    if (!existingTaskTexts.has(clean) && !existingTaskTexts.has(cleanNorm)) {
                         delete taskEntries[taskKey];
                         cleanedTasks++;
                         changed = true;
@@ -2109,6 +2231,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         return dueItems;
     }
+
     async evaluateRollover(prevNoteTitle, currentNoteTitle, prevLines) {
         const prevNoteDate = parseNoteDateFlexible(prevNoteTitle);
         const noteDate = parseNoteDateFlexible(currentNoteTitle);
@@ -2185,7 +2308,11 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 }
             }
 
-            if (isChecked && (!data || (!data.repeat && (!weekdays || weekdays.length === 0)))) {
+            const untilDate = data && data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
+            const startDate = data && data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
+            const isPeriodActive = data && data.start && data.until && noteDate.isSameOrBefore(untilDate, 'day');
+
+            if (isChecked && (!data || (!data.repeat && (!weekdays || weekdays.length === 0) && !isPeriodActive))) {
                 continue;
             }
 
@@ -2197,13 +2324,12 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     seenContextKeys.add(contextKey);
                     seenCleanTexts.add(lowerClean);
                 }
+                this.saveTaskData(currentNoteTitle, contextKey, { isCleared: true, cleanText });
                 continue;
             }
 
             const interval = data.repeat ? parseInterval(data.repeat) : null;
             let targetDate = data.next ? window.moment(data.next, "YYYY-MM-DD") : null;
-            const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
-            const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
 
             if (untilDate && noteDate.isAfter(untilDate, 'day')) {
                 continue;
@@ -2511,7 +2637,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             for (const u of updates) {
                 if (u.isHeading) {
                     const headingText = cleanHeadingString(u.newText);
-                    if (/^(clear|remove|delete|none|reset)$/i.test(u.rawTag)) {
+                    if (/^(clear|remove|delete|none|reset|cancel|stop)$/i.test(u.rawTag)) {
                         await this.deleteHeadingType(fileKey, headingText);
                     } else {
                         const headingType = this.normalizeHeadingType(u.rawTag);
@@ -2768,22 +2894,58 @@ module.exports = class DailyTasksPlugin extends Plugin {
     saveTaskData(fileKey, taskKey, data) {
         if (!this.store.tasks) this.store.tasks = {};
         if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
+
+        const clean = data.cleanText || cleanTaskString(taskKey);
+        const cleanNorm = normalizeForMatching(clean);
+        for (const k of Object.keys(this.store.tasks[fileKey])) {
+            const entry = this.store.tasks[fileKey][k];
+            if (entry && entry.isCleared) {
+                const entryClean = entry.cleanText || cleanTaskString(k);
+                if (entryClean === clean || normalizeForMatching(entryClean) === cleanNorm) {
+                    delete this.store.tasks[fileKey][k];
+                }
+            }
+        }
+
         this.store.tasks[fileKey][taskKey] = data;
         this.invalidateSortCache();
         this.requestSaveStore();
     }
 
     deleteTaskData(fileKey, taskKey, cleanText = null) {
-        const activeFile = this.app.vault.getMarkdownFiles().find(f => f.basename === fileKey);
+        const activeFile = this.app.workspace.getActiveFile()?.basename === fileKey
+            ? this.app.workspace.getActiveFile()
+            : this.app.vault.getMarkdownFiles().find(f => f.basename === fileKey);
         const isTracker = isTasksTrackerFile(activeFile, this.app);
 
         if (this.store.tasks && this.store.tasks[fileKey]) {
-            if (isTracker) {
-                if (this.store.tasks[fileKey][taskKey]) delete this.store.tasks[fileKey][taskKey];
-                if (cleanText && this.store.tasks[fileKey][cleanText]) delete this.store.tasks[fileKey][cleanText];
-            } else {
-                const targetKey = taskKey || cleanText;
-                this.store.tasks[fileKey][targetKey] = { isCleared: true, cleanText: cleanText || targetKey };
+            const clean = cleanText || cleanTaskString(taskKey);
+            const targetCleanNorm = normalizeForMatching(clean);
+
+            for (const k of Object.keys(this.store.tasks[fileKey])) {
+                const entry = this.store.tasks[fileKey][k];
+                const entryClean = entry?.cleanText || cleanTaskString(k);
+                const kWithoutPrefix = k.includes(" > ") ? k.split(" > ").pop().trim() : k;
+                const kClean = cleanTaskString(kWithoutPrefix);
+
+                const isMatch = k === taskKey ||
+                                k === clean ||
+                                entryClean === clean ||
+                                kClean === clean ||
+                                normalizeForMatching(entryClean) === targetCleanNorm ||
+                                normalizeForMatching(kClean) === targetCleanNorm ||
+                                k.endsWith(` > ${clean}`);
+
+                if (isMatch) {
+                    delete this.store.tasks[fileKey][k];
+                }
+            }
+
+            if (!isTracker) {
+                this.store.tasks[fileKey][clean] = { isCleared: true, cleanText: clean };
+                if (taskKey && taskKey !== clean) {
+                    this.store.tasks[fileKey][taskKey] = { isCleared: true, cleanText: clean, contextKey: taskKey };
+                }
             }
         }
         this.invalidateSortCache();
@@ -2833,7 +2995,10 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const map = this.store.tasks[item.name];
             if (map) {
                 const matched = matchTaskEntry(map, taskText, contextKey, context.ancestorTexts, context.childTexts, context.dateStr);
-                if (matched && !matched.isCleared) {
+                if (matched) {
+                    if (matched.isCleared) {
+                        return null;
+                    }
                     const inherited = { ...matched };
                     if (inherited.fromTracker && item.name !== fileKey) {
                         return null;
@@ -2932,6 +3097,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const interval = data.repeat ? parseInterval(data.repeat) : null;
             const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years && !data.weekdays;
             const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
+            const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
             if (isDaily && (!startDate || noteDate.isSameOrAfter(startDate, 'day'))) {
                 data = { ...data, next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD") };
             }
@@ -2942,7 +3108,9 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 ancestorTexts,
                 childTexts
             });
-            if (startDate && noteDate.isBefore(startDate, 'day')) {
+            if (untilDate && noteDate.isAfter(untilDate, 'day')) {
+                isDueToday = false;
+            } else if (startDate && noteDate.isBefore(startDate, 'day')) {
                 isDueToday = false;
             } else if (data.next) {
                 const nextM = window.moment(data.next, "YYYY-MM-DD");
