@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, MarkdownView, Notice, normalizePath, Modal } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, MarkdownView, Notice, normalizePath, Modal, editorInfoField } = require("obsidian");
 const { ViewPlugin, Decoration, MatchDecorator, WidgetType } = require("@codemirror/view");
 
 const NUMBER_WORDS = {
@@ -20,6 +20,13 @@ const WEEKDAYS = {
     "friday": 5, "fri": 5, "fridays": 5,
     "saturday": 6, "sat": 6, "saturdays": 6
 };
+
+const DAILY_REPEAT_RE = /\b(?:every\s+day|daily)\b/i;
+const INLINE_OPTIONAL_RE = /::[^:\n]*\boptional\b[^:\n]*::/i;
+const TASK_LINE_RE = /^\s*-\s*\[.\]/;
+const CHECKED_LINE_RE = /^\s*-\s*\[x\]/i;
+const HEADING_LINE_RE = /^#{1,6}\s+/;
+const TAG_END_RE = /(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/;
 
 function normalizeForMatching(text) {
     if (!text) return "";
@@ -147,7 +154,7 @@ function getWeekdayDate(baseDate, targetDayNum, modifier) {
 
 function parseNaturalDate(rawStr, baseDate) {
     if (!rawStr) return null;
-    const s = normalizeNaturalText(rawStr).trim();
+    const s = normalizeNaturalText(rawStr).replace(/^on\s+/i, "").trim();
 
     if (/\b(?:today|tonight)\b/i.test(s)) {
         return { date: baseDate.clone(), hasYear: true };
@@ -176,7 +183,7 @@ function parseNaturalDate(rawStr, baseDate) {
             const hasYear = f.includes("Y");
             if (!hasYear) {
                 m.year(baseDate.year());
-                if (m.isBefore(baseDate, 'day')) m.add(1, 'year');
+                if (m.isBefore(baseDate, "day")) m.add(1, "year");
             }
             return { date: m, hasYear };
         }
@@ -241,14 +248,14 @@ function formatRepeatUnits(interval) {
 }
 
 function getNextMatchingWeekdayDate(baseDate, daysArray, startDate = null) {
-    let check = startDate && startDate.isAfter(baseDate, 'day') ? startDate.clone() : baseDate.clone();
+    let check = startDate && startDate.isAfter(baseDate, "day") ? startDate.clone() : baseDate.clone();
     for (let i = 0; i <= 7; i++) {
         if (daysArray.includes(check.day())) {
             return check;
         }
-        check.add(1, 'days');
+        check.add(1, "days");
     }
-    return baseDate.clone().add(1, 'days');
+    return baseDate.clone().add(1, "days");
 }
 
 function parseTaskTag(tagRaw, baseDate, existingData = null) {
@@ -308,8 +315,8 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
             if (rStart && rEnd) {
                 explicitStartDate = rStart.date.clone();
                 explicitUntilDate = rEnd.date.clone();
-                if (explicitUntilDate.isBefore(explicitStartDate, 'day') && !rEnd.hasYear) {
-                    explicitUntilDate.add(1, 'year');
+                if (explicitUntilDate.isBefore(explicitStartDate, "day") && !rEnd.hasYear) {
+                    explicitUntilDate.add(1, "year");
                 }
                 segLower = recurRangeMatch[1].trim();
             }
@@ -330,15 +337,15 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
                 explicitStartDate = parsedStart.date.clone();
                 explicitUntilDate = parsedEnd.date.clone();
 
-                if (explicitUntilDate.isBefore(explicitStartDate, 'day')) {
+                if (explicitUntilDate.isBefore(explicitStartDate, "day")) {
                     if (!parsedEnd.hasYear) {
-                        explicitUntilDate.add(1, 'year');
+                        explicitUntilDate.add(1, "year");
                     } else if (!parsedStart.hasYear) {
-                        explicitStartDate.subtract(1, 'year');
+                        explicitStartDate.subtract(1, "year");
                     }
                 }
 
-                if (baseDate.isSameOrAfter(explicitStartDate, 'day') && baseDate.isSameOrBefore(explicitUntilDate, 'day')) {
+                if (baseDate.isSameOrAfter(explicitStartDate, "day") && baseDate.isSameOrBefore(explicitUntilDate, "day")) {
                     explicitNextDate = baseDate.clone();
                 } else {
                     explicitNextDate = explicitStartDate.clone();
@@ -347,31 +354,36 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
             }
         }
 
-        const untilMatch = segLower.match(/\b(?:until|til|till|thru|through|up\s*to|to|due|by)\s+([0-9\/\-\.a-z\s]+)$/i);
-        if (untilMatch) {
-            const uStr = untilMatch[1].trim();
-            const parsedU = parseNaturalDate(uStr, baseDate);
-            if (parsedU) {
-                explicitUntilDate = parsedU.date.clone();
-                segLower = segLower.replace(untilMatch[0], "").trim();
-            }
-        }
+        for (let pass = 0; pass < 2; pass++) {
+            const clauseMatch = segLower.match(/\b(until|til|till|thru|through|up\s*to|to|due|by|starting\s+from|starting|from|after)\s+([0-9\/\-\.a-z\s]+?)$/i);
+            if (!clauseMatch) break;
+            const kw = clauseMatch[1].toLowerCase();
+            const argStr = clauseMatch[2].trim();
+            const isStartKw = /^(starting\s+from|starting|from|after)$/.test(kw);
 
-        const startMatch = segLower.match(/\b(?:starting|from|after)\s+([0-9\/\-\.a-z\s]+)$/i);
-        if (startMatch && !/\b(?:every|each|repeat)\b/i.test(startMatch[0])) {
-            let sStr = startMatch[1].trim();
-            if (sStr === "tomorrow") {
-                explicitStartDate = /after\s+tomorrow/i.test(startMatch[0]) ? baseDate.clone().add(2, "days") : baseDate.clone().add(1, "days");
-            } else {
-                const parsedS = parseNaturalDate(sStr, baseDate);
-                if (parsedS) {
-                    explicitStartDate = parsedS.date.clone();
+            if (isStartKw) {
+                if (/\b(?:every|each|repeat)\b/i.test(clauseMatch[0])) break;
+                let matchedStart = null;
+                if (argStr === "tomorrow") {
+                    matchedStart = kw === "after" ? baseDate.clone().add(2, "days") : baseDate.clone().add(1, "days");
                 } else {
-                    const intv = parseInterval(sStr);
-                    if (intv) explicitStartDate = addToDate(baseDate, intv);
+                    const parsedS = parseNaturalDate(argStr, baseDate);
+                    if (parsedS) {
+                        matchedStart = parsedS.date.clone();
+                    } else {
+                        const intv = parseInterval(argStr);
+                        if (intv) matchedStart = addToDate(baseDate, intv);
+                    }
                 }
+                if (!matchedStart) break;
+                explicitStartDate = matchedStart;
+                segLower = segLower.slice(0, clauseMatch.index).trim();
+            } else {
+                const parsedU = parseNaturalDate(argStr, baseDate);
+                if (!parsedU) break;
+                explicitUntilDate = parsedU.date.clone();
+                segLower = segLower.slice(0, clauseMatch.index).trim();
             }
-            segLower = segLower.replace(startMatch[0], "").trim();
         }
 
         if (!segLower) continue;
@@ -480,8 +492,8 @@ function parseTaskTag(tagRaw, baseDate, existingData = null) {
         }
     }
 
-    if (explicitStartDate && (!explicitNextDate || explicitNextDate.isBefore(explicitStartDate, 'day'))) {
-        if (explicitUntilDate && baseDate.isSameOrAfter(explicitStartDate, 'day') && baseDate.isSameOrBefore(explicitUntilDate, 'day')) {
+    if (explicitStartDate && (!explicitNextDate || explicitNextDate.isBefore(explicitStartDate, "day"))) {
+        if (explicitUntilDate && baseDate.isSameOrAfter(explicitStartDate, "day") && baseDate.isSameOrBefore(explicitUntilDate, "day")) {
             explicitNextDate = baseDate.clone();
         } else {
             explicitNextDate = explicitStartDate.clone();
@@ -511,18 +523,18 @@ function formatOrdinalDate(mDate) {
 }
 
 function formatCompoundRelativeDiff(targetDate, baseDate) {
-    if (targetDate.isSame(baseDate, 'day')) {
-        return `(today)`;
+    if (targetDate.isSame(baseDate, "day")) {
+        return "(today)";
     }
-    const isPast = targetDate.isBefore(baseDate, 'day');
-    const start = isPast ? targetDate.clone().startOf('day') : baseDate.clone().startOf('day');
-    const end = isPast ? baseDate.clone().startOf('day') : targetDate.clone().startOf('day');
+    const isPast = targetDate.isBefore(baseDate, "day");
+    const start = isPast ? targetDate.clone().startOf("day") : baseDate.clone().startOf("day");
+    const end = isPast ? baseDate.clone().startOf("day") : targetDate.clone().startOf("day");
 
-    const years = end.diff(start, 'years');
-    const cur = start.clone().add(years, 'years');
-    const months = end.diff(cur, 'months');
-    cur.add(months, 'months');
-    const totalDays = end.diff(cur, 'days');
+    const years = end.diff(start, "years");
+    const cur = start.clone().add(years, "years");
+    const months = end.diff(cur, "months");
+    cur.add(months, "months");
+    const totalDays = end.diff(cur, "days");
     const weeks = Math.floor(totalDays / 7);
     const days = totalDays % 7;
 
@@ -532,7 +544,7 @@ function formatCompoundRelativeDiff(targetDate, baseDate) {
     if (weeks > 0) parts.push(`${weeks} ${weeks === 1 ? "week" : "weeks"}`);
     if (days > 0) parts.push(`${days} ${days === 1 ? "day" : "days"}`);
 
-    if (parts.length === 0) return `(today)`;
+    if (parts.length === 0) return "(today)";
 
     let unitStr = "";
     if (parts.length === 1) {
@@ -540,7 +552,7 @@ function formatCompoundRelativeDiff(targetDate, baseDate) {
     } else if (parts.length === 2) {
         unitStr = `${parts[0]} and ${parts[1]}`;
     } else {
-        const initial = parts.slice(0, -1).join(`, `);
+        const initial = parts.slice(0, -1).join(", ");
         unitStr = `${initial}, and ${parts[parts.length - 1]}`;
     }
 
@@ -562,6 +574,11 @@ function cleanTaskString(text) {
                .trim();
 }
 
+function cleanTaskForRename(text) {
+    if (!text) return "";
+    return cleanTaskString(text.replace(/(?:::|\s::)[^:\n]*$/, ""));
+}
+
 function computeTaskKey(cleanText, ancestorTexts = [], childTexts = [], dateStr = null) {
     if (!cleanText) return "";
     let key = cleanText;
@@ -580,27 +597,23 @@ function computeTaskKey(cleanText, ancestorTexts = [], childTexts = [], dateStr 
     return key;
 }
 
-function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTexts = [], targetDate = null) {
-    if (!map) return null;
-
+function scoreTaskCandidates(candidates, map, cleanText, targetNorm, contextKey, ancestorTexts = [], childTexts = [], targetDate = null) {
     let bestEntry = null;
     let maxScore = -1;
     let clearedMatch = null;
 
-    const targetNorm = normalizeForMatching(cleanText);
-
-    for (const [k, entry] of Object.entries(map)) {
+    for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        const k = c.key;
+        const entry = c.entry;
         if (!entry) continue;
-        const entryClean = entry.cleanText || cleanTaskString(k);
-        const kWithoutPrefix = k.includes(" > ") ? k.split(" > ").pop().trim() : k;
-        const kClean = cleanTaskString(kWithoutPrefix);
 
-        const isMatch = entryClean === cleanText ||
-                        kClean === cleanText ||
+        const isMatch = c.entryClean === cleanText ||
+                        c.kClean === cleanText ||
                         k === cleanText ||
                         k.endsWith(` > ${cleanText}`) ||
-                        normalizeForMatching(entryClean) === targetNorm ||
-                        normalizeForMatching(kClean) === targetNorm;
+                        c.normEntry === targetNorm ||
+                        c.normK === targetNorm;
 
         if (!isMatch) continue;
 
@@ -611,7 +624,7 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
 
         let score = 0;
         if (k === contextKey) score += 1000;
-        else if (kClean === cleanText) score += 500;
+        else if (c.kClean === cleanText) score += 500;
 
         if (targetDate && entry.next === targetDate) {
             score += 200;
@@ -622,16 +635,22 @@ function matchTaskEntry(map, cleanText, contextKey, ancestorTexts = [], childTex
         }
 
         if (entry.childTexts && childTexts && childTexts.length > 0) {
-            const matchCount = entry.childTexts.filter(c => childTexts.includes(c)).length;
+            let matchCount = 0;
+            for (let j = 0; j < entry.childTexts.length; j++) {
+                if (childTexts.includes(entry.childTexts[j])) matchCount++;
+            }
             if (matchCount > 0) {
                 score += matchCount * 50;
-            } else if (entry.childTexts.length > 0 && childTexts.length > 0) {
+            } else if (entry.childTexts.length > 0) {
                 score -= 100;
             }
         }
 
         if (entry.ancestorTexts && ancestorTexts && ancestorTexts.length > 0) {
-            const matchCount = entry.ancestorTexts.filter(a => ancestorTexts.includes(a)).length;
+            let matchCount = 0;
+            for (let j = 0; j < entry.ancestorTexts.length; j++) {
+                if (ancestorTexts.includes(entry.ancestorTexts[j])) matchCount++;
+            }
             score += matchCount * 30;
         }
 
@@ -702,10 +721,14 @@ function extractLegacyBadgeInfo(line, baseDate) {
 }
 
 const DATE_CACHE = new Map();
+const STRICT_DATE_CACHE = new Map();
 
 function parseNoteDateFlexible(name) {
     if (!name) return window.moment();
-    if (DATE_CACHE.has(name)) return DATE_CACHE.get(name).clone();
+    if (DATE_CACHE.has(name)) {
+        const cached = DATE_CACHE.get(name);
+        return cached ? cached.clone() : window.moment();
+    }
     const clean = name.replace(/\[|\]/g, "").trim();
     const formats = [
         "Do [of] MMM, YYYY", "Do of MMM, YYYY", "D MMM YYYY", "Do MMMM YYYY",
@@ -720,16 +743,18 @@ function parseNoteDateFlexible(name) {
         }
     }
     const loose = window.moment(clean, formats);
-    const res = loose.isValid() ? loose : window.moment();
-    DATE_CACHE.set(name, res);
-    return res.clone();
+    if (loose.isValid()) {
+        DATE_CACHE.set(name, loose);
+        return loose.clone();
+    }
+    DATE_CACHE.set(name, null);
+    return window.moment();
 }
 
 function parseNoteDateStrict(name) {
     if (!name) return null;
-    const cacheKey = `strict_${name}`;
-    if (DATE_CACHE.has(cacheKey)) {
-        const cached = DATE_CACHE.get(cacheKey);
+    if (STRICT_DATE_CACHE.has(name)) {
+        const cached = STRICT_DATE_CACHE.get(name);
         return cached ? cached.clone() : null;
     }
     const clean = name.replace(/\[|\]/g, "").trim();
@@ -741,11 +766,11 @@ function parseNoteDateStrict(name) {
     for (const f of formats) {
         const m = window.moment(clean, f, true);
         if (m.isValid()) {
-            DATE_CACHE.set(cacheKey, m);
+            STRICT_DATE_CACHE.set(name, m);
             return m.clone();
         }
     }
-    DATE_CACHE.set(cacheKey, null);
+    STRICT_DATE_CACHE.set(name, null);
     return null;
 }
 
@@ -829,20 +854,42 @@ function collectDomAncestorTaskTexts(container) {
         texts.push(cleanTaskString(extractDirectTextContent(cur)));
         cur = cur.parentElement ? cur.parentElement.closest("li") : null;
     }
+    return texts.reverse();
+}
+
+function collectDomChildTaskTexts(container) {
+    const texts = [];
+    if (!container || container.tagName !== "LI") return texts;
+    const nestedList = container.querySelector(":scope > ul, :scope > ol");
+    if (!nestedList) return texts;
+    const childLis = nestedList.querySelectorAll(":scope > li");
+    for (const cLi of childLis) {
+        const t = cleanTaskString(extractDirectTextContent(cLi));
+        if (t) texts.push(t);
+    }
     return texts;
 }
 
-function isTaskOverdue(data, noteDate) {
-    if (!data || !data.next) return false;
-    if (data.repeat && /every\s+day|daily/i.test(data.repeat)) return false;
+function isIsoDateStr(s) {
+    return typeof s === "string" && s.length === 10 && s[4] === "-" && s[7] === "-";
+}
+
+function isTaskOverdue(data, noteDateOrStr) {
+    if (!data || !data.next || !noteDateOrStr) return false;
+    if (data.repeat && DAILY_REPEAT_RE.test(data.repeat)) return false;
+    const noteDateStr = typeof noteDateOrStr === "string" ? noteDateOrStr : noteDateOrStr.format("YYYY-MM-DD");
     if (data.start && data.until) {
-        const untilM = window.moment(data.until, "YYYY-MM-DD");
-        if (untilM.isValid()) {
-            return noteDate.isAfter(untilM, 'day');
+        if (isIsoDateStr(data.until)) {
+            return noteDateStr > data.until;
         }
+        const untilM = window.moment(data.until, "YYYY-MM-DD");
+        return untilM.isValid() && window.moment(noteDateStr, "YYYY-MM-DD").isAfter(untilM, "day");
+    }
+    if (isIsoDateStr(data.next)) {
+        return data.next < noteDateStr;
     }
     const nextM = window.moment(data.next, "YYYY-MM-DD");
-    return nextM.isValid() && nextM.isBefore(noteDate, 'day');
+    return nextM.isValid() && nextM.isBefore(window.moment(noteDateStr, "YYYY-MM-DD"), "day");
 }
 
 function extractDirectTextContent(element) {
@@ -850,7 +897,7 @@ function extractDirectTextContent(element) {
     for (const child of element.childNodes) {
         if (child.nodeType === Node.TEXT_NODE) {
             text += child.textContent;
-        } else if (child.nodeType === Node.ELEMENT_NODE && !['UL', 'OL'].includes(child.tagName)) {
+        } else if (child.nodeType === Node.ELEMENT_NODE && !["UL", "OL"].includes(child.tagName)) {
             if (!child.classList.contains("task-progress-badge") && !child.classList.contains("task-custom-tooltip")) {
                 text += child.textContent;
             }
@@ -865,14 +912,14 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
     const lines = normalizedContent.split("\n");
     const lineCount = lines.length;
 
-    const taskItems = [];
+    const taskItems = new Array(lineCount);
     for (let i = 0; i < lineCount; i++) {
         const text = lines[i];
-        const isTask = /^\s*-\s*\[.\]/.test(text);
-        const isHeading = /^#{1,6}\s+/.test(text);
+        const isTask = TASK_LINE_RE.test(text);
+        const isHeading = !isTask && HEADING_LINE_RE.test(text);
         const indentMatch = text.match(/^(\s*)/);
         const indent = indentMatch ? indentMatch[1].replace(/\t/g, "    ").length : 0;
-        taskItems.push({ lineNum: i, text, isTask, isHeading, indent });
+        taskItems[i] = { lineNum: i, text, isTask, isHeading, indent };
     }
 
     let importedCount = 0;
@@ -882,11 +929,14 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
         const item = taskItems[i];
         if (!item.isTask && !item.isHeading) continue;
 
-        const match = item.text.match(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/);
+        const match = item.text.match(TAG_END_RE);
         if (!match) continue;
 
+        const beforeMatch = item.text.slice(0, match.index);
+        if (((beforeMatch.match(/`/g) || []).length % 2) !== 0) continue;
+
         const rawTag = match[1].trim();
-        const cleanLine = item.text.replace(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/, "").trimEnd();
+        const cleanLine = item.text.replace(TAG_END_RE, "").trimEnd();
         modifiedLines[i] = cleanLine;
 
         if (item.isHeading) {
@@ -900,7 +950,7 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
             continue;
         }
 
-        let ancestorTexts = [];
+        const ancestorTexts = [];
         let curIndent = item.indent;
         for (let p = i - 1; p >= 0; p--) {
             if (taskItems[p].isTask && taskItems[p].indent < curIndent) {
@@ -910,7 +960,7 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
             }
         }
 
-        let childTexts = [];
+        const childTexts = [];
         let directChildIndent = -1;
         for (let c = i + 1; c < lineCount; c++) {
             if (taskItems[c].indent <= item.indent) break;
@@ -928,11 +978,11 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
         const taskKey = computeTaskKey(cleanText, ancestorTexts, childTexts, isTracker ? nextStrTemp : null);
 
         if (!parsed.isClear) {
-            let repeat = parsed.explicitRepeat;
-            let orig = parsed.explicitOrigDate ? parsed.explicitOrigDate.format("YYYY-MM-DD") : noteDate.format("YYYY-MM-DD");
-            let start = parsed.explicitStartDate ? parsed.explicitStartDate.format("YYYY-MM-DD") : null;
-            let until = parsed.explicitUntilDate ? parsed.explicitUntilDate.format("YYYY-MM-DD") : null;
-            let isOptional = parsed.hasExplicitOptional ? parsed.isOptional : false;
+            const repeat = parsed.explicitRepeat;
+            const orig = parsed.explicitOrigDate ? parsed.explicitOrigDate.format("YYYY-MM-DD") : noteDate.format("YYYY-MM-DD");
+            const start = parsed.explicitStartDate ? parsed.explicitStartDate.format("YYYY-MM-DD") : null;
+            const until = parsed.explicitUntilDate ? parsed.explicitUntilDate.format("YYYY-MM-DD") : null;
+            const isOptional = parsed.hasExplicitOptional ? parsed.isOptional : false;
 
             let nextStr = null;
             if (parsed.explicitNextDate) {
@@ -971,29 +1021,38 @@ async function bulkImportTasksFromContent(plugin, content, sourceFileKey, isTrac
     }
 
     if (importedCount > 0) {
-        plugin.invalidateSortCache();
+        plugin.invalidateSortCache(sourceFileKey);
         await plugin.flushStore();
     }
 
     return { importedCount, modifiedContent: modifiedLines.join("\n") };
 }
 
+function getEditorViewFile(plugin, view) {
+    if (typeof editorInfoField !== "undefined") {
+        try {
+            const info = view.state.field(editorInfoField, false);
+            if (info && info.file) return info.file;
+        } catch (e) {}
+    }
+    return plugin.app.workspace.getActiveViewOfType(MarkdownView)?.file || null;
+}
+
 function createTagDecorationExtension(plugin) {
     const decorator = new MatchDecorator({
         regexp: /(?<=^|\s)::[^\n]*/g,
         decoration: (match, view, pos) => {
-            const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
-            if (!activeView || !activeView.file || !isPeriodicOrDailyNote(activeView.file, plugin.app, plugin.store.settings.folderOverride)) {
-                return null;
-            }
             const line = view.state.doc.lineAt(pos);
             const lineText = line.text;
-            if (!/^\s*-\s*\[.\]/.test(lineText) && !/^#{1,6}\s+/.test(lineText)) {
+            if (!TASK_LINE_RE.test(lineText) && !HEADING_LINE_RE.test(lineText)) {
                 return null;
             }
             const beforeMatch = lineText.substring(0, pos - line.from);
-            const backtickCount = (beforeMatch.match(/`/g) || []).length;
-            if (backtickCount % 2 !== 0) {
+            if (((beforeMatch.match(/`/g) || []).length % 2) !== 0) {
+                return null;
+            }
+            const file = getEditorViewFile(plugin, view);
+            if (!file || !isPeriodicOrDailyNote(file, plugin.app, plugin.store.settings.folderOverride)) {
                 return null;
             }
             return Decoration.mark({
@@ -1037,7 +1096,7 @@ class ProgressWidget extends WidgetType {
         badge.innerHTML = `
             <svg class="task-progress-ring" viewBox="0 0 16 16">
                 <circle class="task-progress-ring-bg" cx="8" cy="8" r="5.5"></circle>
-                <circle class="task-progress-ring-fill ${this.percent === 100 ? 'complete' : ''}" cx="8" cy="8" r="5.5" stroke-dasharray="${strokeDash} ${circumference}"></circle>
+                <circle class="task-progress-ring-fill ${this.percent === 100 ? "complete" : ""}" cx="8" cy="8" r="5.5" stroke-dasharray="${strokeDash} ${circumference}"></circle>
             </svg>
             <span class="task-progress-count">${this.percent}% (${this.completed}/${this.total})</span>
         `;
@@ -1053,64 +1112,112 @@ function createLivePreviewProgressExtension(plugin) {
     return ViewPlugin.fromClass(
         class {
             constructor(view) {
-                this.decorations = this.buildDeco(view);
+                this.lastStoreVersion = plugin.storeVersion;
+                const file = getEditorViewFile(plugin, view);
+                this.lastFilePath = file ? file.path : "";
+                this.decorations = this.buildDeco(view, file);
             }
             update(update) {
-                if (update.docChanged || update.viewportChanged) {
-                    this.decorations = this.buildDeco(update.view);
+                const file = getEditorViewFile(plugin, update.view);
+                const filePath = file ? file.path : "";
+                if (update.docChanged || this.lastStoreVersion !== plugin.storeVersion || this.lastFilePath !== filePath) {
+                    this.lastStoreVersion = plugin.storeVersion;
+                    this.lastFilePath = filePath;
+                    this.decorations = this.buildDeco(update.view, file);
                 }
             }
-            buildDeco(view) {
+            buildDeco(view, file) {
                 const doc = view.state.doc;
-                const decos = [];
                 const lineCount = doc.lines;
-                const lineData = [];
+                const lineData = new Array(lineCount);
 
-                const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
-                const fileKey = (activeView && activeView.file) ? activeView.file.basename : "";
-                const noteDate = fileKey ? parseNoteDateFlexible(fileKey) : null;
+                const fileKey = file ? file.basename : "";
+                const isDailyOrTracker = file ? isPeriodicOrDailyNote(file, plugin.app, plugin.store.settings.folderOverride) : false;
+                const isTracker = isDailyOrTracker && isTasksTrackerFile(file, plugin.app);
+                const noteDateStr = isDailyOrTracker ? (isTracker ? window.moment() : parseNoteDateFlexible(fileKey)).format("YYYY-MM-DD") : null;
+
+                const ancestorStack = [];
 
                 for (let i = 1; i <= lineCount; i++) {
                     const line = doc.line(i);
                     const text = line.text;
-                    const isTask = /^\s*-\s*\[.\]/.test(text);
-                    const isChecked = /^\s*-\s*\[x\]/i.test(text);
+                    const isTask = TASK_LINE_RE.test(text);
                     const indentMatch = text.match(/^(\s*)/);
                     const indent = indentMatch ? indentMatch[1].replace(/\t/g, "    ").length : 0;
 
-                    let isOptional = /::\s*optional\b/i.test(text);
-                    let isOverdue = false;
-                    if (isTask && fileKey && !isChecked) {
-                        const cleanText = cleanTaskString(text);
-                        const data = plugin.getTaskData(fileKey, cleanText);
-                        if (data && data.isOptional) isOptional = true;
-                        if (data && isTaskOverdue(data, noteDate)) isOverdue = true;
+                    if (!isTask) {
+                        while (ancestorStack.length > 0 && ancestorStack[ancestorStack.length - 1].indent >= indent) {
+                            ancestorStack.pop();
+                        }
+                        lineData[i - 1] = { from: line.from, to: line.to, isTask: false, indent };
+                        continue;
                     }
 
-                    lineData.push({ lineNum: i, from: line.from, to: line.to, text, isTask, isOptional, isOverdue, isChecked, indent });
+                    while (ancestorStack.length > 0 && ancestorStack[ancestorStack.length - 1].indent >= indent) {
+                        ancestorStack.pop();
+                    }
+
+                    const cleanText = cleanTaskString(text);
+                    const ancestorTexts = ancestorStack.length > 0 ? ancestorStack.map(a => a.cleanText) : [];
+                    ancestorStack.push({ indent, cleanText });
+
+                    lineData[i - 1] = {
+                        from: line.from,
+                        to: line.to,
+                        isTask: true,
+                        isChecked: CHECKED_LINE_RE.test(text),
+                        hasInlineOptional: INLINE_OPTIONAL_RE.test(text),
+                        indent,
+                        cleanText,
+                        ancestorTexts,
+                        isOptional: false,
+                        isOverdue: false
+                    };
                 }
 
-                for (let i = 0; i < lineData.length; i++) {
+                const decos = [];
+
+                for (let i = lineCount - 1; i >= 0; i--) {
                     const item = lineData[i];
                     if (!item.isTask) continue;
 
+                    const hasChildren = i + 1 < lineCount && lineData[i + 1].indent > item.indent;
                     let total = 0;
                     let completed = 0;
-                    let directIndent = -1;
+                    let childTexts = [];
 
-                    for (let j = i + 1; j < lineData.length; j++) {
-                        const child = lineData[j];
-                        if (child.indent <= item.indent) break;
-                        if (!child.isTask) continue;
+                    if (hasChildren) {
+                        let directIndent = -1;
+                        for (let j = i + 1; j < lineCount; j++) {
+                            const child = lineData[j];
+                            if (child.indent <= item.indent) break;
+                            if (!child.isTask) continue;
 
-                        if (directIndent === -1) {
-                            directIndent = child.indent;
+                            if (directIndent === -1) {
+                                directIndent = child.indent;
+                            }
+
+                            if (child.indent === directIndent) {
+                                childTexts.push(child.cleanText);
+                                if (!child.isOptional) {
+                                    total++;
+                                    if (child.isChecked) completed++;
+                                }
+                            }
                         }
+                    }
 
-                        if (child.indent === directIndent && !child.isOptional) {
-                            total++;
-                            if (child.isChecked) completed++;
-                        }
+                    let data = null;
+                    if (isDailyOrTracker && fileKey) {
+                        data = plugin.getTaskData(fileKey, item.cleanText, {
+                            ancestorTexts: item.ancestorTexts,
+                            childTexts
+                        });
+                    }
+
+                    item.isOptional = item.hasInlineOptional || !!(data && data.isOptional);
+                    if (!item.isChecked && data && noteDateStr) {
+                        item.isOverdue = isTaskOverdue(data, noteDateStr);
                     }
 
                     if (total > 0) {
@@ -1169,7 +1276,7 @@ class TooltipManager {
                 const getCleanRel = (target) => formatCompoundRelativeDiff(target, refDate).replace(/^\(|\)$/g, "");
                 let diffHtml = "";
 
-                if (refDate.isBefore(startM, 'day')) {
+                if (refDate.isBefore(startM, "day")) {
                     const startDiff = getCleanRel(startM);
                     const endDiff = getCleanRel(untilM);
                     diffHtml = `
@@ -1181,7 +1288,7 @@ class TooltipManager {
                             <span class="task-tooltip-diff-val">${endDiff}</span>
                         </div>
                     `;
-                } else if (refDate.isSameOrAfter(startM, 'day') && refDate.isSameOrBefore(untilM, 'day')) {
+                } else if (refDate.isSameOrAfter(startM, "day") && refDate.isSameOrBefore(untilM, "day")) {
                     const endDiff = getCleanRel(untilM);
                     diffHtml = `
                         <div class="task-tooltip-diff-grid">
@@ -1281,6 +1388,7 @@ class TooltipManager {
             `;
         }
 
+        if (!html) return;
         this.renderTooltip(targetEl, html);
     }
 
@@ -1324,6 +1432,7 @@ class TooltipManager {
     }
 
     destroy() {
+        if (this.hideTimeout) clearTimeout(this.hideTimeout);
         if (this.tooltipEl && this.tooltipEl.parentNode) {
             this.tooltipEl.parentNode.removeChild(this.tooltipEl);
         }
@@ -1440,6 +1549,7 @@ class DailyTasksSettingTab extends PluginSettingTab {
                     .onChange(async (value) => {
                         this.plugin.store.settings.folderOverride = value.trim();
                         await this.plugin.saveData(this.plugin.store);
+                        this.plugin.refreshOpenEditors();
                     });
             });
 
@@ -1516,7 +1626,9 @@ class DailyTasksSettingTab extends PluginSettingTab {
                    .setClass("daily-tasks-settings-btn-danger")
                    .onClick(async () => {
                        this.plugin.store = { tasks: {}, headings: {}, settings: this.plugin.store.settings || {} };
+                       this.plugin.invalidateSortCache();
                        await this.plugin.saveData(this.plugin.store);
+                       this.plugin.refreshOpenEditors();
                        new Notice("All Daily Tasks schedule data cleared.");
                    });
             });
@@ -1558,9 +1670,17 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         this.tooltipManager = new TooltipManager();
         this.isAutoUpdatingCheckboxes = false;
+        this.isInternalEditorUpdate = false;
         this.scanTimeout = null;
+        this._saveTimeout = null;
         this.cleanupTimer = null;
         this.fileTaskSnapshots = new Map();
+        this._fileIndexCache = new Map();
+        this._globalDateIndex = null;
+        this._getTaskDataCache = new Map();
+        this._cachedSortedFiles = null;
+        this._rolloverCache = null;
+        this.storeVersion = 0;
 
         this.tasksApi = new TasksTemplateApi(this);
         window.tasks = this.tasksApi;
@@ -1569,11 +1689,12 @@ module.exports = class DailyTasksPlugin extends Plugin {
         if (this.store && this.store.tasks) {
             let repaired = false;
             for (const fileKey of Object.keys(this.store.tasks)) {
-                const noteDate = parseNoteDateFlexible(fileKey);
+                let noteDate = null;
                 for (const tKey of Object.keys(this.store.tasks[fileKey])) {
                     const t = this.store.tasks[fileKey][tKey];
                     if (t && t.rawTag && (!t.start || !t.until || !t.next)) {
                         if (/\b(?:from|to|until|thru|through)\b/i.test(t.rawTag)) {
+                            if (!noteDate) noteDate = parseNoteDateFlexible(fileKey);
                             const parsed = parseTaskTag(t.rawTag, noteDate, t);
                             if (parsed.explicitStartDate || parsed.explicitUntilDate || parsed.explicitNextDate) {
                                 if (parsed.explicitStartDate) t.start = parsed.explicitStartDate.format("YYYY-MM-DD");
@@ -1617,6 +1738,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
                             const result = await bulkImportTasksFromContent(this, content, file.basename, isTracker);
                             if (result.importedCount > 0) {
                                 await this.app.vault.modify(file, result.modifiedContent);
+                                this.refreshOpenEditors();
                                 new Notice(`Successfully imported ${result.importedCount} scheduled task(s) from "${file.basename}".`);
                             } else {
                                 new Notice(`No unimported scheduled task tags found in "${file.basename}".`);
@@ -1632,7 +1754,9 @@ module.exports = class DailyTasksPlugin extends Plugin {
                             const fileKey = file.basename;
                             if (this.store.tasks[fileKey]) delete this.store.tasks[fileKey];
                             if (this.store.headings[fileKey]) delete this.store.headings[fileKey];
-                            await this.saveData(this.store);
+                            this.invalidateSortCache();
+                            await this.flushStore();
+                            this.refreshOpenEditors();
                             new Notice(`Cleared data for ${fileKey}`);
                         });
                 });
@@ -1640,45 +1764,45 @@ module.exports = class DailyTasksPlugin extends Plugin {
         );
 
         this.registerDomEvent(document, "mouseover", (evt) => {
-            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (!activeView || !activeView.file) return;
-            if (!isPeriodicOrDailyNote(activeView.file, this.app, this.store.settings.folderOverride)) return;
+            const checkbox = evt.target.closest('input[type="checkbox"], .task-list-item-checkbox, .cm-formatting-task');
+            const headingEl = !checkbox ? evt.target.closest("h1, h2, h3, h4, h5, h6, .HyperMD-header") : null;
+            if (!checkbox && !headingEl) return;
 
-            const fileKey = activeView.file.basename;
-            const isTracker = isTasksTrackerFile(activeView.file, this.app);
+            const targetView = this.getMarkdownViewForTarget(evt.target);
+            if (!targetView || !targetView.file) return;
+            if (!isPeriodicOrDailyNote(targetView.file, this.app, this.store.settings.folderOverride)) return;
+
+            const fileKey = targetView.file.basename;
+            const isTracker = isTasksTrackerFile(targetView.file, this.app);
             const noteDate = isTracker ? window.moment() : parseNoteDateFlexible(fileKey);
 
-            const headingEl = evt.target.closest("h1, h2, h3, h4, h5, h6, .HyperMD-header");
             if (headingEl) {
                 const headingText = cleanHeadingString(headingEl.textContent || "");
                 const hType = this.getHeadingType(fileKey, headingText);
                 if (hType) {
                     headingEl.classList.add("heading-has-type");
                     this.tooltipManager.showHeading(headingEl, hType);
-                    return;
                 }
+                return;
             }
-
-            const checkbox = evt.target.closest('input[type="checkbox"], .task-list-item-checkbox, .cm-formatting-task');
-            if (!checkbox) return;
 
             let cleanText = "";
             let ancestorCleanTexts = [];
             let childCleanTexts = [];
 
-            const cmView = activeView.editor && activeView.editor.cm;
-            if (cmView && typeof cmView.posAtDOM === "function") {
+            const cmView = targetView.editor && targetView.editor.cm;
+            if (cmView && cmView.dom && cmView.dom.contains(checkbox) && typeof cmView.posAtDOM === "function") {
                 try {
                     const pos = cmView.posAtDOM(checkbox);
                     const lineNum = cmView.state.doc.lineAt(pos).number - 1;
-                    const line = activeView.editor.getLine(lineNum);
+                    const line = targetView.editor.getLine(lineNum);
                     cleanText = cleanTaskString(line);
 
                     let currentIndent = (line.match(/^(\s*)/)[1] || "").replace(/\t/g, "    ").length;
                     if (currentIndent > 0) {
                         for (let p = lineNum - 1; p >= 0; p--) {
-                            const pLine = activeView.editor.getLine(p);
-                            if (/^\s*-\s*\[.\]/.test(pLine)) {
+                            const pLine = targetView.editor.getLine(p);
+                            if (TASK_LINE_RE.test(pLine)) {
                                 const pIndent = (pLine.match(/^(\s*)/)[1] || "").replace(/\t/g, "    ").length;
                                 if (pIndent < currentIndent) {
                                     ancestorCleanTexts.unshift(cleanTaskString(pLine));
@@ -1689,15 +1813,15 @@ module.exports = class DailyTasksPlugin extends Plugin {
                         }
                     }
 
-                    const totalLines = activeView.editor.lineCount();
+                    const totalLines = targetView.editor.lineCount();
                     const selfIndent = (line.match(/^(\s*)/)[1] || "").replace(/\t/g, "    ").length;
                     let directChildIndent = -1;
                     for (let c = lineNum + 1; c < totalLines; c++) {
-                        const cLine = activeView.editor.getLine(c);
+                        const cLine = targetView.editor.getLine(c);
                         const cIndentMatch = cLine.match(/^(\s*)/);
                         const cIndent = cIndentMatch ? cIndentMatch[1].replace(/\t/g, "    ").length : 0;
                         if (cIndent <= selfIndent) break;
-                        if (/^\s*-\s*\[.\]/.test(cLine)) {
+                        if (TASK_LINE_RE.test(cLine)) {
                             if (directChildIndent === -1) directChildIndent = cIndent;
                             if (cIndent === directChildIndent) {
                                 childCleanTexts.push(cleanTaskString(cLine));
@@ -1708,19 +1832,21 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     const container = checkbox.closest("li, .cm-line");
                     cleanText = cleanTaskString(container ? extractDirectTextContent(container) : "");
                     ancestorCleanTexts = collectDomAncestorTaskTexts(container);
+                    childCleanTexts = collectDomChildTaskTexts(container);
                 }
             } else {
                 const container = checkbox.closest("li, .cm-line");
                 cleanText = cleanTaskString(container ? extractDirectTextContent(container) : "");
                 ancestorCleanTexts = collectDomAncestorTaskTexts(container);
+                childCleanTexts = collectDomChildTaskTexts(container);
             }
 
             if (!cleanText) return;
 
             let data = this.getTaskData(fileKey, cleanText, { ancestorTexts: ancestorCleanTexts, childTexts: childCleanTexts });
             if (!data) {
-                for (const ancestorText of ancestorCleanTexts) {
-                    data = this.getTaskData(fileKey, ancestorText);
+                for (let idx = ancestorCleanTexts.length - 1; idx >= 0; idx--) {
+                    data = this.getTaskData(fileKey, ancestorCleanTexts[idx]);
                     if (data) break;
                 }
             }
@@ -1739,15 +1865,15 @@ module.exports = class DailyTasksPlugin extends Plugin {
         });
 
         this.registerEvent(
-            this.app.workspace.on("editor-change", async (editor) => {
-                const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (!activeView || !activeView.file) return;
-                if (!isPeriodicOrDailyNote(activeView.file, this.app, this.store.settings.folderOverride)) return;
+            this.app.workspace.on("editor-change", (editor, info) => {
+                if (this.isAutoUpdatingCheckboxes || this.isInternalEditorUpdate) return;
+                const file = (info && info.file) || this.app.workspace.getActiveViewOfType(MarkdownView)?.file;
+                if (!file || !isPeriodicOrDailyNote(file, this.app, this.store.settings.folderOverride)) return;
 
-                const fileKey = activeView.file.basename;
-                await this.handleEditorTaskRenames(editor, fileKey);
+                const fileKey = file.basename;
+                const { structureChanged } = this.handleEditorTaskRenames(editor, fileKey);
 
-                if (!this.isAutoUpdatingCheckboxes) {
+                if (structureChanged) {
                     this.autoCheckParentTasks(editor, fileKey);
                 }
 
@@ -1758,18 +1884,19 @@ module.exports = class DailyTasksPlugin extends Plugin {
         this.registerEvent(
             this.app.workspace.on("file-open", async (file) => {
                 if (!file) return;
-                const isDailyOrTracker = isPeriodicOrDailyNote(file, this.app, this.store.settings.folderOverride);
-                if (!isDailyOrTracker) return;
+                if (!isPeriodicOrDailyNote(file, this.app, this.store.settings.folderOverride)) return;
 
                 const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (activeView && activeView.editor) {
+                if (activeView && activeView.file && activeView.file.path === file.path && activeView.editor) {
                     const content = activeView.editor.getValue();
                     const tagMatches = content.match(/(?:::|\s::)\s*([^:\n]+)\s*::/g);
                     if (tagMatches && tagMatches.length >= 10) {
                         const isTracker = isTasksTrackerFile(file, this.app);
                         const res = await bulkImportTasksFromContent(this, content, file.basename, isTracker);
                         if (res.importedCount > 0) {
+                            this.isInternalEditorUpdate = true;
                             activeView.editor.setValue(res.modifiedContent);
+                            this.isInternalEditorUpdate = false;
                         }
                     }
 
@@ -1779,111 +1906,222 @@ module.exports = class DailyTasksPlugin extends Plugin {
             })
         );
 
+        this.app.workspace.onLayoutReady(() => {
+            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+            if (activeView && activeView.file && activeView.editor && isPeriodicOrDailyNote(activeView.file, this.app, this.store.settings.folderOverride)) {
+                this.updateFileSnapshot(activeView.editor, activeView.file.basename);
+            }
+        });
+
         this.setupCleanupInterval();
         setTimeout(async () => {
             await this.cleanupExpiredTrackerTasks();
         }, 1200);
     }
 
-    updateFileSnapshot(editor, fileKey) {
-        const lineCount = editor.lineCount();
-        const currentTasks = [];
-        const currentHeadings = [];
-        for (let i = 0; i < lineCount; i++) {
-            const text = editor.getLine(i);
-            if (/^\s*-\s*\[.\]/.test(text)) {
-                currentTasks.push({ line: i, clean: cleanTaskString(text) });
-            } else if (/^#{1,6}\s+/.test(text)) {
-                currentHeadings.push({ line: i, clean: cleanHeadingString(text) });
-            }
+    getMarkdownViewForTarget(target) {
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (activeView && activeView.containerEl.contains(target)) {
+            return activeView;
         }
-        this.fileTaskSnapshots.set(fileKey, { tasks: currentTasks, headings: currentHeadings });
+        let matchedView = null;
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (!matchedView && leaf.view instanceof MarkdownView && leaf.view.containerEl.contains(target)) {
+                matchedView = leaf.view;
+            }
+        });
+        return matchedView;
     }
 
-    async handleEditorTaskRenames(editor, fileKey) {
+    refreshOpenEditors() {
+        this.storeVersion++;
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view instanceof MarkdownView) {
+                if (leaf.view.editor?.cm?.dispatch) {
+                    try {
+                        leaf.view.editor.cm.dispatch({});
+                    } catch (e) {}
+                }
+                if (leaf.view.getMode && leaf.view.getMode() === "preview" && leaf.view.previewMode?.rerender) {
+                    try {
+                        leaf.view.previewMode.rerender(true);
+                    } catch (e) {}
+                }
+            }
+        });
+    }
+
+    buildEditorSnapshot(editor) {
         const lineCount = editor.lineCount();
-        const currentTasks = [];
-        const currentHeadings = [];
+        const tasks = [];
+        const headings = [];
+        const ancestorStack = [];
 
         for (let i = 0; i < lineCount; i++) {
             const text = editor.getLine(i).replace(/\r/g, "");
-            if (/^\s*-\s*\[.\]/.test(text)) {
-                currentTasks.push({ line: i, clean: cleanTaskString(text) });
-            } else if (/^#{1,6}\s+/.test(text)) {
-                currentHeadings.push({ line: i, clean: cleanHeadingString(text) });
-            }
-        }
+            const isTask = TASK_LINE_RE.test(text);
+            const indentMatch = text.match(/^(\s*)/);
+            const indent = indentMatch ? indentMatch[1].replace(/\t/g, "    ").length : 0;
 
-        const prevSnapshot = this.fileTaskSnapshots.get(fileKey);
-        if (prevSnapshot) {
-            const prevTasks = prevSnapshot.tasks || [];
-            const prevHeadings = prevSnapshot.headings || [];
-
-            if (prevTasks.length === currentTasks.length) {
-                let diffCount = 0;
-                let oldT = null;
-                let newT = null;
-
-                for (let idx = 0; idx < currentTasks.length; idx++) {
-                    if (prevTasks[idx].clean !== currentTasks[idx].clean) {
-                        diffCount++;
-                        oldT = prevTasks[idx];
-                        newT = currentTasks[idx];
-                    }
+            if (isTask) {
+                while (ancestorStack.length > 0 && ancestorStack[ancestorStack.length - 1].indent >= indent) {
+                    ancestorStack.pop();
                 }
-
-                if (diffCount === 1 && oldT && newT && oldT.clean && newT.clean) {
-                    await this.renameTaskData(fileKey, oldT.clean, newT.clean);
+                const clean = cleanTaskString(text);
+                const renameClean = cleanTaskForRename(text);
+                const ancestorTexts = ancestorStack.map(a => a.clean);
+                ancestorStack.push({ indent, clean });
+                tasks.push({
+                    line: i,
+                    raw: text,
+                    clean,
+                    renameClean,
+                    isChecked: CHECKED_LINE_RE.test(text),
+                    indent,
+                    ancestorTexts,
+                    childTexts: []
+                });
+            } else {
+                while (ancestorStack.length > 0 && ancestorStack[ancestorStack.length - 1].indent >= indent) {
+                    ancestorStack.pop();
                 }
-            }
-
-            if (prevHeadings.length === currentHeadings.length) {
-                for (let idx = 0; idx < currentHeadings.length; idx++) {
-                    const prevH = prevHeadings[idx];
-                    const currH = currentHeadings[idx];
-                    if (prevH.clean && currH.clean && prevH.clean !== currH.clean) {
-                        await this.renameHeadingData(fileKey, prevH.clean, currH.clean);
-                    }
+                if (HEADING_LINE_RE.test(text)) {
+                    headings.push({ line: i, raw: text, clean: cleanHeadingString(text) });
                 }
             }
         }
 
-        this.fileTaskSnapshots.set(fileKey, { tasks: currentTasks, headings: currentHeadings });
+        for (let i = 0; i < tasks.length; i++) {
+            const parent = tasks[i];
+            let directIndent = -1;
+            for (let j = i + 1; j < tasks.length; j++) {
+                const child = tasks[j];
+                if (child.indent <= parent.indent) break;
+                if (directIndent === -1) directIndent = child.indent;
+                if (child.indent === directIndent) {
+                    parent.childTexts.push(child.clean);
+                }
+            }
+        }
+
+        return { tasks, headings };
     }
 
-    async renameTaskData(fileKey, oldTaskText, newTaskText) {
+    updateFileSnapshot(editor, fileKey) {
+        this.fileTaskSnapshots.set(fileKey, this.buildEditorSnapshot(editor));
+    }
+
+    handleEditorTaskRenames(editor, fileKey) {
+        const currentSnapshot = this.buildEditorSnapshot(editor);
+        const prevSnapshot = this.fileTaskSnapshots.get(fileKey);
+
+        if (!prevSnapshot) {
+            this.fileTaskSnapshots.set(fileKey, currentSnapshot);
+            return { structureChanged: true };
+        }
+
+        const prevTasks = prevSnapshot.tasks;
+        const currentTasks = currentSnapshot.tasks;
+        const prevHeadings = prevSnapshot.headings;
+        const currentHeadings = currentSnapshot.headings;
+
+        let structureChanged = prevTasks.length !== currentTasks.length;
+
+        if (!structureChanged) {
+            for (let i = 0; i < currentTasks.length; i++) {
+                if (prevTasks[i].isChecked !== currentTasks[i].isChecked || prevTasks[i].indent !== currentTasks[i].indent) {
+                    structureChanged = true;
+                    break;
+                }
+            }
+        }
+
+        if (prevTasks.length === currentTasks.length) {
+            let diffCount = 0;
+            let oldT = null;
+            let newT = null;
+
+            for (let idx = 0; idx < currentTasks.length; idx++) {
+                if (prevTasks[idx].raw === currentTasks[idx].raw) continue;
+                if (prevTasks[idx].renameClean !== currentTasks[idx].renameClean) {
+                    diffCount++;
+                    oldT = prevTasks[idx];
+                    newT = currentTasks[idx];
+                    if (diffCount > 1) break;
+                }
+            }
+
+            if (diffCount === 1 && oldT && newT && oldT.renameClean && newT.renameClean) {
+                this.renameTaskData(fileKey, oldT.renameClean, newT.renameClean, oldT, newT);
+            }
+        }
+
+        if (prevHeadings.length === currentHeadings.length) {
+            for (let idx = 0; idx < currentHeadings.length; idx++) {
+                if (prevHeadings[idx].raw === currentHeadings[idx].raw) continue;
+                const prevH = prevHeadings[idx];
+                const currH = currentHeadings[idx];
+                if (prevH.clean && currH.clean && prevH.clean !== currH.clean) {
+                    this.renameHeadingData(fileKey, prevH.clean, currH.clean);
+                }
+            }
+        }
+
+        this.fileTaskSnapshots.set(fileKey, currentSnapshot);
+        return { structureChanged };
+    }
+
+    renameTaskData(fileKey, oldTaskText, newTaskText, oldMeta = null, newMeta = null) {
         if (!oldTaskText || !newTaskText || oldTaskText === newTaskText) return;
         let existingData = null;
 
+        const oldAncestors = oldMeta?.ancestorTexts || [];
+        const oldChildren = oldMeta?.childTexts || [];
+        const oldContextKey = computeTaskKey(oldTaskText, oldAncestors, oldChildren);
+
         if (this.store.tasks && this.store.tasks[fileKey]) {
-            const oldCleanNorm = normalizeForMatching(oldTaskText);
-            for (const k of Object.keys(this.store.tasks[fileKey])) {
-                const entry = this.store.tasks[fileKey][k];
-                const entryClean = entry?.cleanText || cleanTaskString(k);
-                if (k === oldTaskText || entryClean === oldTaskText || normalizeForMatching(entryClean) === oldCleanNorm) {
-                    if (!existingData) existingData = entry;
-                    delete this.store.tasks[fileKey][k];
+            const matched = this.matchTaskInFile(fileKey, oldTaskText, oldContextKey, oldAncestors, oldChildren);
+            if (matched && !matched.isCleared) {
+                existingData = matched;
+                const oldCleanNorm = normalizeForMatching(oldTaskText);
+                for (const k of Object.keys(this.store.tasks[fileKey])) {
+                    const entry = this.store.tasks[fileKey][k];
+                    if (entry === matched) {
+                        delete this.store.tasks[fileKey][k];
+                        continue;
+                    }
+                    const entryClean = entry?.cleanText || cleanTaskString(k);
+                    const sameClean = k === oldTaskText || entryClean === oldTaskText || normalizeForMatching(entryClean) === oldCleanNorm;
+                    if (sameClean && (!entry?.ancestorTexts || entry.ancestorTexts.join("\0") === oldAncestors.join("\0"))) {
+                        delete this.store.tasks[fileKey][k];
+                    }
                 }
             }
         }
 
         if (!existingData) {
-            existingData = this.getTaskData(fileKey, oldTaskText);
+            existingData = this.getTaskData(fileKey, oldTaskText, { ancestorTexts: oldAncestors, childTexts: oldChildren });
         }
 
-        if (existingData) {
+        if (existingData && !existingData.isCleared) {
             if (!this.store.tasks) this.store.tasks = {};
             if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
-            this.store.tasks[fileKey][newTaskText] = {
+            const newAncestors = newMeta?.ancestorTexts || existingData.ancestorTexts || [];
+            const newChildren = newMeta?.childTexts || existingData.childTexts || [];
+            const newContextKey = computeTaskKey(newTaskText, newAncestors, newChildren);
+            this.store.tasks[fileKey][newContextKey || newTaskText] = {
                 ...existingData,
                 cleanText: newTaskText,
-                contextKey: newTaskText
+                contextKey: newContextKey || newTaskText,
+                ancestorTexts: newAncestors,
+                childTexts: newChildren
             };
-            await this.saveData(this.store);
+            this.invalidateSortCache(fileKey);
+            this.requestSaveStore();
         }
     }
 
-    async renameHeadingData(fileKey, oldHeadingText, newHeadingText) {
+    renameHeadingData(fileKey, oldHeadingText, newHeadingText) {
         const oldH = oldHeadingText.toLowerCase();
         const newH = newHeadingText.toLowerCase();
         if (oldH === newH) return;
@@ -1892,7 +2130,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const type = this.store.headings[fileKey][oldH];
             delete this.store.headings[fileKey][oldH];
             this.store.headings[fileKey][newH] = type;
-            await this.saveData(this.store);
+            this.requestSaveStore();
         }
     }
 
@@ -1948,7 +2186,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
             let content = "";
             try {
-                content = await this.app.vault.read(file);
+                content = await this.app.vault.cachedRead(file);
             } catch (e) {
                 continue;
             }
@@ -1958,11 +2196,11 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const existingHeadings = new Set();
 
             for (const line of lines) {
-                if (/^\s*-\s*\[.\]/.test(line)) {
-                    existingTaskTexts.add(cleanTaskString(line));
-                    existingTaskTexts.add(normalizeForMatching(cleanTaskString(line)));
-                }
-                if (/^#{1,6}\s+/.test(line)) {
+                if (TASK_LINE_RE.test(line)) {
+                    const clean = cleanTaskString(line);
+                    existingTaskTexts.add(clean);
+                    existingTaskTexts.add(normalizeForMatching(clean));
+                } else if (HEADING_LINE_RE.test(line)) {
                     existingHeadings.add(cleanHeadingString(line).toLowerCase());
                 }
             }
@@ -2001,7 +2239,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
         }
 
         if (changed) {
-            await this.saveData(this.store);
+            this.invalidateSortCache();
+            await this.flushStore();
         }
         return { cleanedTasks, cleanedFiles };
     }
@@ -2010,12 +2249,13 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const trackerFiles = this.getAllTasksTrackerFiles();
         if (trackerFiles.length === 0) return;
 
-        const today = window.moment().startOf('day');
+        const todayStr = window.moment().format("YYYY-MM-DD");
+        let storeChanged = false;
 
         for (const file of trackerFiles) {
             let content = "";
             try {
-                content = await this.app.vault.read(file);
+                content = await this.app.vault.cachedRead(file);
             } catch (e) {
                 continue;
             }
@@ -2033,31 +2273,22 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 if (!data) return false;
 
                 if (data.repeat) {
-                    if (data.until) {
-                        const untilM = window.moment(data.until, "YYYY-MM-DD");
-                        if (untilM.isValid() && today.isAfter(untilM, 'day')) {
-                            return true;
-                        }
+                    if (data.until && todayStr > data.until) {
+                        return true;
                     }
                     return false;
                 }
 
                 if (data.until) {
-                    const untilM = window.moment(data.until, "YYYY-MM-DD");
-                    if (untilM.isValid() && today.isAfter(untilM, 'day')) {
-                        return true;
-                    }
-                } else if (data.next) {
-                    const nextM = window.moment(data.next, "YYYY-MM-DD");
-                    if (nextM.isValid() && today.isAfter(nextM, 'day')) {
-                        return true;
-                    }
+                    return todayStr > data.until;
+                }
+                if (data.next) {
+                    return todayStr > data.next;
                 }
                 return false;
             };
 
-            const filterTrackerTree = (nodes) => {
-                const result = [];
+            const collectDeletedLineIndices = (nodes, deletedSet) => {
                 for (const node of nodes) {
                     if (shouldDeleteTrackerItem(node)) {
                         hasDeletions = true;
@@ -2067,38 +2298,41 @@ module.exports = class DailyTasksPlugin extends Plugin {
                         if (this.store.tasks && this.store.tasks[file.basename]) {
                             delete this.store.tasks[file.basename][contextKey];
                             delete this.store.tasks[file.basename][cleanText];
+                            storeChanged = true;
                         }
+                        const markSubtreeDeleted = (n) => {
+                            if (typeof n.lineIndex === "number") {
+                                deletedSet.add(n.lineIndex);
+                            }
+                            for (const c of n.children) {
+                                markSubtreeDeleted(c);
+                            }
+                        };
+                        markSubtreeDeleted(node);
                         continue;
                     }
-                    node.children = filterTrackerTree(node.children);
-                    result.push(node);
+                    collectDeletedLineIndices(node.children, deletedSet);
                 }
-                return result;
             };
 
-            const filteredTree = filterTrackerTree(tree);
+            const deletedLines = new Set();
+            collectDeletedLineIndices(tree, deletedLines);
 
-            if (hasDeletions) {
+            if (hasDeletions && deletedLines.size > 0) {
                 const newLines = [];
-                const nonTaskLeading = [];
-
-                for (const l of lines) {
-                    if (/^\s*-\s*\[.\]/.test(l)) {
-                        break;
+                for (let i = 0; i < lines.length; i++) {
+                    if (!deletedLines.has(i)) {
+                        newLines.push(lines[i]);
                     }
-                    nonTaskLeading.push(l);
                 }
-
-                newLines.push(...nonTaskLeading);
-                for (const item of filteredTree) {
-                    newLines.push(...this.formatTaskTree(item, false));
-                }
-
                 await this.app.vault.modify(file, newLines.join("\n"));
             }
         }
 
-        await this.saveData(this.store);
+        if (storeChanged) {
+            this.invalidateSortCache();
+            await this.flushStore();
+        }
     }
 
     async purgeTaskSchedules(options) {
@@ -2141,7 +2375,9 @@ module.exports = class DailyTasksPlugin extends Plugin {
         }
 
         if (changed) {
-            await this.saveData(this.store);
+            this.invalidateSortCache();
+            await this.flushStore();
+            this.refreshOpenEditors();
         }
 
         return { purgedTasks, purgedNotes };
@@ -2152,12 +2388,8 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const results = [];
         for (let i = 0; i < files.length; i++) {
             const f = files[i];
-            const cache = this.app.metadataCache.getFileCache(f);
-            if (cache && cache.frontmatter) {
-                const fm = cache.frontmatter;
-                if (fm.tasksTracker === true || fm.tasksTracker === "true" || fm.taskstracker === true || fm.taskstracker === "true" || fm.taskTracker === true || fm.taskTracker === "true" || fm.tasktracker === true || fm.tasktracker === "true") {
-                    results.push(f);
-                }
+            if (isTasksTrackerFile(f, this.app)) {
+                results.push(f);
             }
         }
         return results;
@@ -2189,15 +2421,17 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 const data = this.getTaskData(file.basename, cleanText, { contextKey, childTexts });
 
                 let isDue = false;
+                let weekdays = null;
+                let startDate = null;
                 if (data && !data.isCleared) {
-                    const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
+                    startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
                     const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
                     const nextDate = data.next ? window.moment(data.next, "YYYY-MM-DD") : null;
-                    const weekdays = getWeekdaysFromData(data);
+                    weekdays = getWeekdaysFromData(data);
 
-                    if (untilDate && noteDate.isAfter(untilDate, 'day')) {
+                    if (untilDate && noteDate.isAfter(untilDate, "day")) {
                         isDue = false;
-                    } else if (startDate && noteDate.isBefore(startDate, 'day')) {
+                    } else if (startDate && noteDate.isBefore(startDate, "day")) {
                         isDue = false;
                     } else if (weekdays && weekdays.length > 0) {
                         isDue = weekdays.includes(noteDate.day());
@@ -2207,19 +2441,31 @@ module.exports = class DailyTasksPlugin extends Plugin {
                         if (isDaily) {
                             isDue = true;
                         } else if (nextDate) {
-                            isDue = nextDate.isSame(noteDate, 'day');
+                            isDue = nextDate.isSame(noteDate, "day");
                         }
                     } else {
                         if (startDate && untilDate) {
-                            isDue = noteDate.isSameOrAfter(startDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day');
+                            isDue = noteDate.isSameOrAfter(startDate, "day") && noteDate.isSameOrBefore(untilDate, "day");
                         } else if (nextDate) {
-                            isDue = nextDate.isSame(noteDate, 'day');
+                            isDue = nextDate.isSame(noteDate, "day");
                         }
                     }
                 }
 
                 if (isDue) {
                     const processed = this.filterTreeBySchedule(rootItem, targetNoteTitle, file.basename, null, []);
+                    if (weekdays && weekdays.length > 0 && data) {
+                        const nextMatching = getNextMatchingWeekdayDate(noteDate.clone().add(1, "days"), weekdays, startDate);
+                        this.saveTaskData(targetNoteTitle, contextKey, {
+                            ...data,
+                            cleanText,
+                            contextKey,
+                            ancestorTexts: [],
+                            childTexts,
+                            weekdays,
+                            next: nextMatching.format("YYYY-MM-DD")
+                        });
+                    }
                     dueItems.push({
                         cleanText,
                         contextKey,
@@ -2286,22 +2532,33 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const lowerClean = cleanText.toLowerCase();
             const childTexts = rootItem.children.map(c => cleanTaskString(c.raw));
             const contextKey = computeTaskKey(cleanText, [], childTexts);
-            const isChecked = /^\s*-\s*\[x\]/i.test(rawLine);
+            const isChecked = CHECKED_LINE_RE.test(rawLine);
 
             let data = this.getTaskData(prevNoteTitle, cleanText, { contextKey, childTexts });
             if (!data) {
                 data = extractLegacyBadgeInfo(rawLine, prevNoteDate);
             }
 
-            if (trackerReplacementMap.has(lowerClean) && trackerReplacementMap.get(lowerClean).length > 0) {
-                const replacement = trackerReplacementMap.get(lowerClean).shift();
-                pushWithBlankHandling(todayTasks, replacement.lines);
-                seenContextKeys.add(replacement.contextKey);
-                seenCleanTexts.add(lowerClean);
-                continue;
+            const weekdays = getWeekdaysFromData(data);
+            const trackerList = trackerReplacementMap.get(lowerClean);
+            if (trackerList && trackerList.length > 0) {
+                const exactIdx = trackerList.findIndex(item => item.contextKey === contextKey);
+                if (exactIdx !== -1) {
+                    const [replacement] = trackerList.splice(exactIdx, 1);
+                    pushWithBlankHandling(todayTasks, replacement.lines);
+                    seenContextKeys.add(replacement.contextKey);
+                    seenCleanTexts.add(lowerClean);
+                    continue;
+                }
+                if (data && (data.repeat || (weekdays && weekdays.length > 0) || isChecked)) {
+                    const replacement = trackerList.shift();
+                    pushWithBlankHandling(todayTasks, replacement.lines);
+                    seenContextKeys.add(replacement.contextKey);
+                    seenCleanTexts.add(lowerClean);
+                    continue;
+                }
             }
 
-            const weekdays = getWeekdaysFromData(data);
             if (data && data.fromTracker) {
                 if (data.repeat || (weekdays && weekdays.length > 0) || isChecked || seenCleanTexts.has(lowerClean)) {
                     continue;
@@ -2310,7 +2567,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
             const untilDate = data && data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
             const startDate = data && data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
-            const isPeriodActive = data && data.start && data.until && noteDate.isSameOrBefore(untilDate, 'day');
+            const isPeriodActive = data && data.start && data.until && noteDate.isSameOrBefore(untilDate, "day");
 
             if (isChecked && (!data || (!data.repeat && (!weekdays || weekdays.length === 0) && !isPeriodActive))) {
                 continue;
@@ -2331,11 +2588,11 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const interval = data.repeat ? parseInterval(data.repeat) : null;
             let targetDate = data.next ? window.moment(data.next, "YYYY-MM-DD") : null;
 
-            if (untilDate && noteDate.isAfter(untilDate, 'day')) {
+            if (untilDate && noteDate.isAfter(untilDate, "day")) {
                 continue;
             }
 
-            if (startDate && noteDate.isBefore(startDate, 'day')) {
+            if (startDate && noteDate.isBefore(startDate, "day")) {
                 if (!data.fromTracker) {
                     pushWithBlankHandling(plannedTasks, this.formatTaskTree(processedTree, true));
                 }
@@ -2349,7 +2606,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
                     seenContextKeys.add(contextKey);
                     seenCleanTexts.add(lowerClean);
-                    const nextMatching = getNextMatchingWeekdayDate(noteDate.clone().add(1, 'days'), weekdays, startDate);
+                    const nextMatching = getNextMatchingWeekdayDate(noteDate.clone().add(1, "days"), weekdays, startDate);
                     this.saveTaskData(currentNoteTitle, contextKey, {
                         ...data,
                         weekdays,
@@ -2368,13 +2625,13 @@ module.exports = class DailyTasksPlugin extends Plugin {
             }
 
             if (untilDate && startDate) {
-                if (noteDate.isSameOrAfter(startDate, 'day') && noteDate.isSameOrBefore(untilDate, 'day')) {
+                if (noteDate.isSameOrAfter(startDate, "day") && noteDate.isSameOrBefore(untilDate, "day")) {
                     pushWithBlankHandling(todayTasks, this.formatTaskTree(processedTree, true));
                     seenContextKeys.add(contextKey);
                     seenCleanTexts.add(lowerClean);
                     this.saveTaskData(currentNoteTitle, contextKey, {
                         ...data,
-                        next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD")
+                        next: noteDate.clone().add(1, "days").format("YYYY-MM-DD")
                     });
                     continue;
                 }
@@ -2388,7 +2645,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 seenCleanTexts.add(lowerClean);
                 this.saveTaskData(currentNoteTitle, contextKey, {
                     ...data,
-                    next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD"),
+                    next: noteDate.clone().add(1, "days").format("YYYY-MM-DD"),
                     streak: newStreak
                 });
                 continue;
@@ -2399,7 +2656,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             }
 
             if (targetDate) {
-                const isDueToday = targetDate.isSameOrBefore(noteDate, 'day');
+                const isDueToday = targetDate.isSameOrBefore(noteDate, "day");
                 if (isDueToday) {
                     if (!interval && isChecked) {
                         continue;
@@ -2435,7 +2692,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             }
         }
 
-        for (const [key, items] of trackerReplacementMap.entries()) {
+        for (const [, items] of trackerReplacementMap.entries()) {
             for (let i = 0; i < items.length; i++) {
                 const item = items[i];
                 if (!seenContextKeys.has(item.contextKey)) {
@@ -2469,7 +2726,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const finalToday = cleanFinalArray(todayTasks);
         const finalPlanned = cleanFinalArray(plannedTasks);
 
-        this.flushStore();
+        await this.flushStore();
 
         return {
             todayTasks: finalToday.length > 0 ? finalToday.join("\n") : "- [ ] ",
@@ -2483,8 +2740,12 @@ module.exports = class DailyTasksPlugin extends Plugin {
             resolvedTitle = resolvedTitle.file?.title || resolvedTitle.title || null;
         }
         const currentTitle = resolvedTitle || (this.app.workspace.getActiveFile() ? this.app.workspace.getActiveFile().basename : window.moment().format("YYYY-MM-DD"));
-        const noteDate = parseNoteDateFlexible(currentTitle);
 
+        if (this._rolloverCache && this._rolloverCache.title === currentTitle && (Date.now() - this._rolloverCache.time) < 3000) {
+            return type === "tasks" ? this._rolloverCache.result.todayTasks : this._rolloverCache.result.plannedTasks;
+        }
+
+        const noteDate = parseNoteDateFlexible(currentTitle);
         const allFiles = this.app.vault.getMarkdownFiles();
         const dateFiles = [];
         for (let i = 0; i < allFiles.length; i++) {
@@ -2492,7 +2753,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
             if (f.basename === currentTitle) continue;
             if (!isDailyNoteFile(f, this.app, this.store.settings.folderOverride)) continue;
             const m = parseNoteDateFlexible(f.basename);
-            if (m.isValid() && m.isBefore(noteDate, 'day')) {
+            if (m.isValid() && m.isBefore(noteDate, "day")) {
                 dateFiles.push({ file: f, date: m });
             }
         }
@@ -2502,12 +2763,15 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         if (!prevFile) {
             const trackerDueItems = await this.getTrackerDueTasksForDate(currentTitle);
-            if (type === "tasks") {
-                const lines = [];
-                for (let i = 0; i < trackerDueItems.length; i++) lines.push(...trackerDueItems[i].lines);
-                return lines.length > 0 ? lines.join("\n") : "- [ ] ";
-            }
-            return "- [ ] ";
+            const lines = [];
+            for (let i = 0; i < trackerDueItems.length; i++) lines.push(...trackerDueItems[i].lines);
+            const result = {
+                todayTasks: lines.length > 0 ? lines.join("\n") : "- [ ] ",
+                plannedTasks: "- [ ] "
+            };
+            this._rolloverCache = { title: currentTitle, time: Date.now(), result };
+            await this.flushStore();
+            return type === "tasks" ? result.todayTasks : result.plannedTasks;
         }
 
         const content = await this.app.vault.cachedRead(prevFile);
@@ -2551,13 +2815,14 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         if (!sectionDetected) {
             for (let i = 0; i < lines.length; i++) {
-                if (/^\s*-\s*\[.\]/.test(lines[i])) {
+                if (TASK_LINE_RE.test(lines[i])) {
                     allPreviousTaskLines.push(lines[i]);
                 }
             }
         }
 
         const rollover = await this.evaluateRollover(prevFile.basename, currentTitle, allPreviousTaskLines);
+        this._rolloverCache = { title: currentTitle, time: Date.now(), result: rollover };
         return type === "tasks" ? rollover.todayTasks : rollover.plannedTasks;
     }
 
@@ -2576,14 +2841,14 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const noteDate = isTracker ? window.moment() : parseNoteDateFlexible(fileKey);
         const updates = [];
 
-        const lines = [];
+        const lines = new Array(lineCount);
         for (let i = 0; i < lineCount; i++) {
             const text = editor.getLine(i);
-            const isTask = /^\s*-\s*\[.\]/.test(text);
-            const isHeading = /^#{1,6}\s+/.test(text);
+            const isTask = TASK_LINE_RE.test(text);
+            const isHeading = !isTask && HEADING_LINE_RE.test(text);
             const indentMatch = text.match(/^(\s*)/);
             const indent = indentMatch ? indentMatch[1].replace(/\t/g, "    ").length : 0;
-            lines.push({ lineNum: i, text, isTask, isHeading, indent });
+            lines[i] = { lineNum: i, text, isTask, isHeading, indent };
         }
 
         for (let i = 0; i < lineCount; i++) {
@@ -2591,13 +2856,16 @@ module.exports = class DailyTasksPlugin extends Plugin {
             if (!item.isTask && !item.isHeading) continue;
 
             const cleanItemText = item.text.replace(/\r/g, "");
-            const match = cleanItemText.match(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/);
+            const match = cleanItemText.match(TAG_END_RE);
             if (match) {
-                const rawTag = match[1].trim();
-                const cleanLine = cleanItemText.replace(/(?:::|\s::)\s*([^:\n\r]+?)\s*::\s*$/, "").trimEnd();
+                const beforeMatch = cleanItemText.slice(0, match.index);
+                if (((beforeMatch.match(/`/g) || []).length % 2) !== 0) continue;
 
-                let ancestorTexts = [];
-                let childTexts = [];
+                const rawTag = match[1].trim();
+                const cleanLine = cleanItemText.replace(TAG_END_RE, "").trimEnd();
+
+                const ancestorTexts = [];
+                const childTexts = [];
 
                 if (item.isTask) {
                     let curIndent = item.indent;
@@ -2634,6 +2902,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
         }
 
         if (updates.length > 0) {
+            let needsAutoCheck = false;
             for (const u of updates) {
                 if (u.isHeading) {
                     const headingText = cleanHeadingString(u.newText);
@@ -2647,20 +2916,25 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     const cleanText = cleanTaskString(u.newText);
                     const tempParsed = parseTaskTag(u.rawTag, noteDate, null);
                     const tempNext = tempParsed.explicitNextDate ? tempParsed.explicitNextDate.format("YYYY-MM-DD") : null;
-                    const taskKey = computeTaskKey(cleanText, u.ancestorTexts, u.childTexts, tempNext);
+                    const taskKey = computeTaskKey(cleanText, u.ancestorTexts, u.childTexts, isTracker ? tempNext : null);
                     const existing = this.getTaskData(fileKey, cleanText, { contextKey: taskKey, ancestorTexts: u.ancestorTexts, childTexts: u.childTexts }) || {};
                     const parsed = parseTaskTag(u.rawTag, noteDate, existing);
 
                     if (parsed.isClear) {
-                        await this.deleteTaskData(fileKey, taskKey, cleanText);
+                        this.deleteTaskData(fileKey, taskKey, cleanText);
+                        needsAutoCheck = true;
                     } else {
-                        let repeat = parsed.explicitRepeat !== null ? parsed.explicitRepeat : (existing.repeat || null);
-                        let orig = parsed.explicitOrigDate ? parsed.explicitOrigDate.format("YYYY-MM-DD") : (existing.orig || (isTracker ? noteDate.format("YYYY-MM-DD") : null));
-                        let start = parsed.explicitStartDate ? parsed.explicitStartDate.format("YYYY-MM-DD") : (existing.start || null);
-                        let until = parsed.explicitUntilDate ? parsed.explicitUntilDate.format("YYYY-MM-DD") : (existing.until || null);
-                        let isOptional = parsed.hasExplicitOptional ? parsed.isOptional : (existing.isOptional || false);
-                        let streak = existing.streak || 0;
-                        let weekdays = parsed.explicitWeekdays || existing.weekdays || null;
+                        const repeat = parsed.explicitRepeat !== null ? parsed.explicitRepeat : (existing.repeat || null);
+                        const orig = parsed.explicitOrigDate ? parsed.explicitOrigDate.format("YYYY-MM-DD") : (existing.orig || (isTracker ? noteDate.format("YYYY-MM-DD") : null));
+                        const start = parsed.explicitStartDate ? parsed.explicitStartDate.format("YYYY-MM-DD") : (existing.start || null);
+                        const until = parsed.explicitUntilDate ? parsed.explicitUntilDate.format("YYYY-MM-DD") : (existing.until || null);
+                        const isOptional = parsed.hasExplicitOptional ? parsed.isOptional : (existing.isOptional || false);
+                        const streak = existing.streak || 0;
+                        const weekdays = parsed.explicitWeekdays || existing.weekdays || null;
+
+                        if (parsed.hasExplicitOptional) {
+                            needsAutoCheck = true;
+                        }
 
                         let nextStr = null;
                         if (parsed.explicitNextDate) {
@@ -2677,7 +2951,7 @@ module.exports = class DailyTasksPlugin extends Plugin {
                             }
                         }
 
-                        await this.saveTaskData(fileKey, taskKey, {
+                        this.saveTaskData(fileKey, taskKey, {
                             cleanText,
                             contextKey: taskKey,
                             ancestorTexts: u.ancestorTexts,
@@ -2695,41 +2969,72 @@ module.exports = class DailyTasksPlugin extends Plugin {
                         });
                     }
                 }
-                editor.setLine(u.lineNum, u.newText);
             }
+
+            this.isInternalEditorUpdate = true;
+            for (const u of updates) {
+                if (editor.getLine(u.lineNum) !== u.newText) {
+                    editor.setLine(u.lineNum, u.newText);
+                }
+            }
+            this.isInternalEditorUpdate = false;
+
+            if (needsAutoCheck) {
+                this.autoCheckParentTasks(editor, fileKey);
+            }
+            this.updateFileSnapshot(editor, fileKey);
+            this.refreshOpenEditors();
         }
     }
 
     autoCheckParentTasks(editor, fileKey) {
         const lineCount = editor.lineCount();
-        const lines = [];
+        const lines = new Array(lineCount);
+        const ancestorStack = [];
+
         for (let i = 0; i < lineCount; i++) {
             const text = editor.getLine(i);
-            const isTask = /^\s*-\s*\[.\]/.test(text);
-            const isChecked = /^\s*-\s*\[x\]/i.test(text);
+            const isTask = TASK_LINE_RE.test(text);
             const indentMatch = text.match(/^(\s*)/);
             const indent = indentMatch ? indentMatch[1].replace(/\t/g, "    ").length : 0;
 
-            let isOptional = false;
-            if (isTask) {
-                const data = this.getTaskData(fileKey, cleanTaskString(text));
-                if (data && data.isOptional) isOptional = true;
+            while (ancestorStack.length > 0 && ancestorStack[ancestorStack.length - 1].indent >= indent) {
+                ancestorStack.pop();
             }
 
-            lines.push({ lineNum: i, text, isTask, isOptional, isChecked, indent });
+            if (!isTask) {
+                lines[i] = { lineNum: i, isTask: false, indent };
+                continue;
+            }
+
+            const cleanText = cleanTaskString(text);
+            const ancestorTexts = ancestorStack.map(a => a.cleanText);
+            ancestorStack.push({ indent, cleanText });
+
+            lines[i] = {
+                lineNum: i,
+                text,
+                isTask: true,
+                isChecked: CHECKED_LINE_RE.test(text),
+                isOptional: INLINE_OPTIONAL_RE.test(text),
+                cleanText,
+                ancestorTexts,
+                indent
+            };
         }
 
         const updates = [];
 
-        for (let i = 0; i < lines.length; i++) {
+        for (let i = lineCount - 1; i >= 0; i--) {
             const parent = lines[i];
             if (!parent.isTask) continue;
 
             let total = 0;
             let completed = 0;
             let directIndent = -1;
+            const childTexts = [];
 
-            for (let j = i + 1; j < lines.length; j++) {
+            for (let j = i + 1; j < lineCount; j++) {
                 const child = lines[j];
                 if (child.indent <= parent.indent) break;
                 if (!child.isTask) continue;
@@ -2738,19 +3043,30 @@ module.exports = class DailyTasksPlugin extends Plugin {
                     directIndent = child.indent;
                 }
 
-                if (child.indent === directIndent && !child.isOptional) {
-                    total++;
-                    if (child.isChecked) completed++;
+                if (child.indent === directIndent) {
+                    childTexts.push(child.cleanText);
+                    if (!child.isOptional) {
+                        total++;
+                        if (child.isChecked) completed++;
+                    }
+                }
+            }
+
+            if (!parent.isOptional) {
+                const data = this.getTaskData(fileKey, parent.cleanText, {
+                    ancestorTexts: parent.ancestorTexts,
+                    childTexts
+                });
+                if (data && data.isOptional) {
+                    parent.isOptional = true;
                 }
             }
 
             if (total > 0) {
                 const shouldBeChecked = (completed === total);
-                if (shouldBeChecked && !parent.isChecked) {
-                    const newText = parent.text.replace(/^(\s*-\s*\[).(\])/, "$1x$2");
-                    updates.push({ lineNum: parent.lineNum, newText });
-                } else if (!shouldBeChecked && parent.isChecked) {
-                    const newText = parent.text.replace(/^(\s*-\s*\[).(\])/, "$1 $2");
+                if (shouldBeChecked !== parent.isChecked) {
+                    parent.isChecked = shouldBeChecked;
+                    const newText = parent.text.replace(/^(\s*-\s*\[).(\])/, shouldBeChecked ? "$1x$2" : "$1 $2");
                     updates.push({ lineNum: parent.lineNum, newText });
                 }
             }
@@ -2762,84 +3078,116 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 editor.setLine(u.lineNum, u.newText);
             }
             this.isAutoUpdatingCheckboxes = false;
+            this.updateFileSnapshot(editor, fileKey);
         }
     }
 
     processProgressBars(container, sourcePath) {
-        let fileKey = sourcePath ? sourcePath.split("/").pop().replace(".md", "") : "";
+        const fileKey = sourcePath ? sourcePath.split("/").pop().replace(".md", "") : "";
+        let isDailyOrTracker = false;
+        let noteDateStr = null;
 
-        if (fileKey) {
-            const noteDate = parseNoteDateFlexible(fileKey);
-            const allLis = container.querySelectorAll("li");
-            for (const li of allLis) {
-                const cb = li.querySelector(':scope > input[type="checkbox"]');
-                if (!cb || cb.checked) continue;
-                const data = this.getTaskData(fileKey, cleanTaskString(extractDirectTextContent(li)));
-                if (data && isTaskOverdue(data, noteDate)) {
-                    li.classList.add("task-overdue-item");
-                }
+        if (fileKey && sourcePath) {
+            const abstractFile = this.app.vault.getAbstractFileByPath(sourcePath);
+            if (abstractFile && isPeriodicOrDailyNote(abstractFile, this.app, this.store.settings.folderOverride)) {
+                isDailyOrTracker = true;
+                const isTracker = isTasksTrackerFile(abstractFile, this.app);
+                noteDateStr = (isTracker ? window.moment() : parseNoteDateFlexible(fileKey)).format("YYYY-MM-DD");
             }
         }
 
         const listItems = container.querySelectorAll("li");
         for (const li of listItems) {
+            const liText = extractDirectTextContent(li);
+            const liClean = cleanTaskString(liText);
+            const ancestorTexts = isDailyOrTracker ? collectDomAncestorTaskTexts(li) : [];
             const nestedUl = li.querySelector(":scope > ul, :scope > ol");
-            if (!nestedUl) continue;
+            const childTexts = [];
 
-            const childLis = nestedUl.querySelectorAll(":scope > li");
-            let total = 0;
-            let completed = 0;
+            if (nestedUl) {
+                const childLis = nestedUl.querySelectorAll(":scope > li");
+                let total = 0;
+                let completed = 0;
 
-            for (const cLi of childLis) {
-                let isOptional = false;
-                if (fileKey) {
-                    const data = this.getTaskData(fileKey, cleanTaskString(extractDirectTextContent(cLi)));
-                    if (data && data.isOptional) isOptional = true;
+                for (const cLi of childLis) {
+                    const cText = extractDirectTextContent(cLi);
+                    const cClean = cleanTaskString(cText);
+                    childTexts.push(cClean);
+                    let isOptional = INLINE_OPTIONAL_RE.test(cText);
+                    if (!isOptional && isDailyOrTracker) {
+                        const cAncestors = [...ancestorTexts, liClean];
+                        const cChildren = collectDomChildTaskTexts(cLi);
+                        const data = this.getTaskData(fileKey, cClean, { ancestorTexts: cAncestors, childTexts: cChildren });
+                        if (data && data.isOptional) isOptional = true;
+                    }
+
+                    const cb = cLi.querySelector(':scope > input[type="checkbox"], :scope > p > input[type="checkbox"]');
+                    if (cb && !isOptional) {
+                        total++;
+                        if (cb.checked) completed++;
+                    }
+                    if (isOptional) {
+                        cLi.classList.add("task-optional-item");
+                    }
                 }
 
-                const cb = cLi.querySelector('input[type="checkbox"]');
-                if (cb && !isOptional) {
-                    total++;
-                    if (cb.checked) completed++;
-                }
-                if (isOptional) {
-                    cLi.classList.add("task-optional-item");
+                if (total > 0) {
+                    const percent = Math.round((completed / total) * 100);
+                    const existingBadge = li.querySelector(":scope > .task-progress-badge, :scope > p > .task-progress-badge");
+                    if (existingBadge) existingBadge.remove();
+
+                    const badge = document.createElement("span");
+                    badge.className = "task-progress-badge";
+
+                    const circumference = 2 * Math.PI * 5.5;
+                    const strokeDash = (percent / 100) * circumference;
+
+                    badge.innerHTML = `
+                        <svg class="task-progress-ring" viewBox="0 0 16 16">
+                            <circle class="task-progress-ring-bg" cx="8" cy="8" r="5.5"></circle>
+                            <circle class="task-progress-ring-fill ${percent === 100 ? "complete" : ""}" cx="8" cy="8" r="5.5" stroke-dasharray="${strokeDash} ${circumference}"></circle>
+                        </svg>
+                        <span class="task-progress-count">${percent}% (${completed}/${total})</span>
+                    `;
+
+                    const isTopLevel = !li.parentElement.closest("li");
+                    const firstP = li.querySelector(":scope > p, :scope > span:not(.task-progress-badge)");
+                    if (firstP) {
+                        if (isTopLevel) firstP.classList.add("task-top-parent-goal");
+                        firstP.appendChild(badge);
+                    } else {
+                        const inlineNodes = [];
+                        for (const child of Array.from(li.childNodes)) {
+                            if (child === nestedUl) break;
+                            if (child.nodeType === Node.ELEMENT_NODE && child.tagName === "INPUT") continue;
+                            inlineNodes.push(child);
+                        }
+                        if (inlineNodes.length > 0) {
+                            const wrapper = document.createElement("span");
+                            if (isTopLevel) wrapper.className = "task-top-parent-goal";
+                            li.insertBefore(wrapper, inlineNodes[0]);
+                            for (const n of inlineNodes) {
+                                wrapper.appendChild(n);
+                            }
+                            wrapper.insertAdjacentElement("afterend", badge);
+                        } else if (nestedUl) {
+                            li.insertBefore(badge, nestedUl);
+                        } else {
+                            li.appendChild(badge);
+                        }
+                    }
                 }
             }
 
-            if (total === 0) continue;
-            const percent = Math.round((completed / total) * 100);
-
-            const existingBadge = li.querySelector(":scope > .task-progress-badge");
-            if (existingBadge) existingBadge.remove();
-
-            const badge = document.createElement("span");
-            badge.className = "task-progress-badge";
-
-            const circumference = 2 * Math.PI * 5.5;
-            const strokeDash = (percent / 100) * circumference;
-
-            badge.innerHTML = `
-                <svg class="task-progress-ring" viewBox="0 0 16 16">
-                    <circle class="task-progress-ring-bg" cx="8" cy="8" r="5.5"></circle>
-                    <circle class="task-progress-ring-fill ${percent === 100 ? 'complete' : ''}" cx="8" cy="8" r="5.5" stroke-dasharray="${strokeDash} ${circumference}"></circle>
-                </svg>
-                <span class="task-progress-count">${percent}% (${completed}/${total})</span>
-            `;
-
-            const isTopLevel = !li.parentElement.closest("li");
-            const firstP = li.querySelector(":scope > p, :scope > span") || li.childNodes[0];
-            if (firstP && firstP.nodeType === Node.TEXT_NODE) {
-                const wrapper = document.createElement("span");
-                if (isTopLevel) wrapper.className = "task-top-parent-goal";
-                li.insertBefore(wrapper, firstP);
-                wrapper.appendChild(firstP);
-                wrapper.insertAdjacentElement("afterend", badge);
-            } else if (firstP && firstP.nodeType === Node.ELEMENT_NODE) {
-                if (isTopLevel) firstP.classList.add("task-top-parent-goal");
-                firstP.insertAdjacentElement("afterend", badge);
-            } else {
-                li.appendChild(badge);
+            if (isDailyOrTracker) {
+                const data = this.getTaskData(fileKey, liClean, { ancestorTexts, childTexts });
+                if (INLINE_OPTIONAL_RE.test(liText) || (data && data.isOptional)) {
+                    li.classList.add("task-optional-item");
+                }
+                const cb = li.querySelector(':scope > input[type="checkbox"], :scope > p > input[type="checkbox"]');
+                if (cb && !cb.checked && data && isTaskOverdue(data, noteDateStr)) {
+                    li.classList.add("task-overdue-item");
+                }
             }
         }
     }
@@ -2855,14 +3203,14 @@ module.exports = class DailyTasksPlugin extends Plugin {
         if (!this.store.headings) this.store.headings = {};
         if (!this.store.headings[fileKey]) this.store.headings[fileKey] = {};
         this.store.headings[fileKey][headingText.toLowerCase()] = type;
-        await this.saveData(this.store);
+        this.requestSaveStore();
     }
 
     async deleteHeadingType(fileKey, headingText) {
         const h = headingText.toLowerCase();
         if (this.store.headings && this.store.headings[fileKey] && this.store.headings[fileKey][h]) {
             delete this.store.headings[fileKey][h];
-            await this.saveData(this.store);
+            this.requestSaveStore();
         }
     }
 
@@ -2882,12 +3230,16 @@ module.exports = class DailyTasksPlugin extends Plugin {
     requestSaveStore() {
         if (this._saveTimeout) clearTimeout(this._saveTimeout);
         this._saveTimeout = setTimeout(async () => {
+            this._saveTimeout = null;
             await this.saveData(this.store);
-        }, 300);
+        }, 500);
     }
 
     async flushStore() {
-        if (this._saveTimeout) clearTimeout(this._saveTimeout);
+        if (this._saveTimeout) {
+            clearTimeout(this._saveTimeout);
+            this._saveTimeout = null;
+        }
         await this.saveData(this.store);
     }
 
@@ -2897,18 +3249,27 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
         const clean = data.cleanText || cleanTaskString(taskKey);
         const cleanNorm = normalizeForMatching(clean);
+        const isDatedDaily = !!parseNoteDateStrict(fileKey);
+        const targetAnc = (data.ancestorTexts || []).join("\0");
+        const targetChild = (data.childTexts || []).join("\0");
+
         for (const k of Object.keys(this.store.tasks[fileKey])) {
+            if (k === taskKey) continue;
             const entry = this.store.tasks[fileKey][k];
-            if (entry && entry.isCleared) {
-                const entryClean = entry.cleanText || cleanTaskString(k);
-                if (entryClean === clean || normalizeForMatching(entryClean) === cleanNorm) {
-                    delete this.store.tasks[fileKey][k];
-                }
+            if (!entry) continue;
+            const entryClean = entry.cleanText || cleanTaskString(k);
+            const sameClean = entryClean === clean || normalizeForMatching(entryClean) === cleanNorm;
+            if (!sameClean) continue;
+
+            if (entry.isCleared) {
+                delete this.store.tasks[fileKey][k];
+            } else if (isDatedDaily && (entry.ancestorTexts || []).join("\0") === targetAnc && (entry.childTexts || []).join("\0") === targetChild) {
+                delete this.store.tasks[fileKey][k];
             }
         }
 
         this.store.tasks[fileKey][taskKey] = data;
-        this.invalidateSortCache();
+        this.invalidateSortCache(fileKey);
         this.requestSaveStore();
     }
 
@@ -2948,73 +3309,174 @@ module.exports = class DailyTasksPlugin extends Plugin {
                 }
             }
         }
-        this.invalidateSortCache();
+        this.invalidateSortCache(fileKey);
         this.requestSaveStore();
     }
 
-    invalidateSortCache() {
+    invalidateSortCache(fileKey = null) {
+        if (fileKey) {
+            this._fileIndexCache.delete(fileKey);
+        } else {
+            this._fileIndexCache.clear();
+        }
         this._cachedSortedFiles = null;
+        this._globalDateIndex = null;
+        this._getTaskDataCache.clear();
+        this._rolloverCache = null;
+        this.storeVersion++;
     }
 
     getSortedDailyFileEntries() {
         if (this._cachedSortedFiles) return this._cachedSortedFiles;
         if (!this.store.tasks) return [];
 
-        this._cachedSortedFiles = Object.keys(this.store.tasks)
-            .map(f => ({ name: f, date: parseNoteDateFlexible(f) }))
-            .filter(f => f.date.isValid())
-            .sort((a, b) => b.date.valueOf() - a.date.valueOf());
+        const entries = [];
+        for (const f of Object.keys(this.store.tasks)) {
+            const d = parseNoteDateStrict(f);
+            if (d) {
+                entries.push({ name: f, date: d, dayVal: d.clone().startOf("day").valueOf() });
+            }
+        }
+        entries.sort((a, b) => b.dayVal - a.dayVal);
+        this._cachedSortedFiles = entries;
+        return entries;
+    }
 
-        return this._cachedSortedFiles;
+    buildFileIndex(fileKey) {
+        if (this._fileIndexCache.has(fileKey)) {
+            return this._fileIndexCache.get(fileKey);
+        }
+        const map = this.store.tasks?.[fileKey];
+        if (!map) {
+            const empty = { byNormClean: new Map(), map: null };
+            this._fileIndexCache.set(fileKey, empty);
+            return empty;
+        }
+
+        const byNormClean = new Map();
+        for (const [k, entry] of Object.entries(map)) {
+            if (!entry) continue;
+            const entryClean = entry.cleanText || cleanTaskString(k);
+            const kWithoutPrefix = k.includes(" > ") ? k.split(" > ").pop().trim() : k;
+            const kClean = cleanTaskString(kWithoutPrefix);
+            const normEntry = normalizeForMatching(entryClean);
+            const normK = normalizeForMatching(kClean);
+
+            const indexed = { key: k, entry, entryClean, kClean, normEntry, normK };
+            if (!byNormClean.has(normEntry)) byNormClean.set(normEntry, []);
+            byNormClean.get(normEntry).push(indexed);
+
+            if (normK !== normEntry) {
+                if (!byNormClean.has(normK)) byNormClean.set(normK, []);
+                byNormClean.get(normK).push(indexed);
+            }
+        }
+
+        const result = { byNormClean, map };
+        this._fileIndexCache.set(fileKey, result);
+        return result;
+    }
+
+    matchTaskInFile(fileKey, cleanText, contextKey, ancestorTexts = [], childTexts = [], targetDate = null) {
+        const index = this.buildFileIndex(fileKey);
+        if (!index.map) return null;
+        const targetNorm = normalizeForMatching(cleanText);
+        const candidates = index.byNormClean.get(targetNorm);
+        if (!candidates || candidates.length === 0) {
+            if (contextKey && index.map[contextKey]) return index.map[contextKey];
+            if (index.map[cleanText]) return index.map[cleanText];
+            return null;
+        }
+        return scoreTaskCandidates(candidates, index.map, cleanText, targetNorm, contextKey, ancestorTexts, childTexts, targetDate);
+    }
+
+    buildGlobalDateIndex() {
+        if (this._globalDateIndex) return this._globalDateIndex;
+        const globalByNorm = new Map();
+        const sortedFiles = this.getSortedDailyFileEntries();
+
+        for (let i = 0; i < sortedFiles.length; i++) {
+            const fileItem = sortedFiles[i];
+            const fileIndex = this.buildFileIndex(fileItem.name);
+            for (const normKey of fileIndex.byNormClean.keys()) {
+                if (!globalByNorm.has(normKey)) {
+                    globalByNorm.set(normKey, []);
+                }
+                globalByNorm.get(normKey).push({
+                    fileKey: fileItem.name,
+                    dayVal: fileItem.dayVal
+                });
+            }
+        }
+
+        this._globalDateIndex = globalByNorm;
+        return globalByNorm;
     }
 
     getTaskData(fileKey, taskText, context = {}) {
-        const noteDate = parseNoteDateFlexible(fileKey);
         const contextKey = context.contextKey || computeTaskKey(taskText, context.ancestorTexts, context.childTexts, context.dateStr);
+        const cacheKey = `${fileKey}\0${taskText}\0${contextKey}\0${context.dateStr || ""}`;
+        if (this._getTaskDataCache.has(cacheKey)) {
+            return this._getTaskDataCache.get(cacheKey);
+        }
+
+        const strictNoteDate = parseNoteDateStrict(fileKey);
+        const noteDate = strictNoteDate || parseNoteDateFlexible(fileKey);
+        const noteDateStr = noteDate.format("YYYY-MM-DD");
+        const nextDayStr = noteDate.clone().add(1, "days").format("YYYY-MM-DD");
 
         if (this.store.tasks && this.store.tasks[fileKey]) {
-            const currentData = matchTaskEntry(this.store.tasks[fileKey], taskText, contextKey, context.ancestorTexts, context.childTexts, context.dateStr);
+            const currentData = this.matchTaskInFile(fileKey, taskText, contextKey, context.ancestorTexts, context.childTexts, context.dateStr);
             if (currentData) {
-                if (currentData.isCleared) return null;
-                if (currentData.repeat && /every\s+day|daily/i.test(currentData.repeat)) {
-                    const startDate = currentData.start ? window.moment(currentData.start, "YYYY-MM-DD") : null;
-                    if (!startDate || noteDate.isSameOrAfter(startDate, 'day')) {
-                        const nextStr = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
-                        return { ...currentData, next: nextStr };
+                let res = currentData;
+                if (currentData.isCleared) {
+                    res = null;
+                } else if (currentData.repeat && DAILY_REPEAT_RE.test(currentData.repeat)) {
+                    if (!currentData.start || noteDateStr >= currentData.start) {
+                        res = { ...currentData, next: nextDayStr };
                     }
                 }
-                return currentData;
+                this._getTaskDataCache.set(cacheKey, res);
+                return res;
             }
         }
 
-        const sortedFiles = this.getSortedDailyFileEntries();
-        for (let i = 0; i < sortedFiles.length; i++) {
-            const item = sortedFiles[i];
-            if (item.date.isAfter(noteDate, 'day')) continue;
+        if (!strictNoteDate) {
+            this._getTaskDataCache.set(cacheKey, null);
+            return null;
+        }
 
-            const map = this.store.tasks[item.name];
-            if (map) {
-                const matched = matchTaskEntry(map, taskText, contextKey, context.ancestorTexts, context.childTexts, context.dateStr);
+        const noteDayVal = strictNoteDate.clone().startOf("day").valueOf();
+        const targetNorm = normalizeForMatching(taskText);
+        const globalIndex = this.buildGlobalDateIndex();
+        const fileList = globalIndex.get(targetNorm);
+
+        if (fileList) {
+            for (let i = 0; i < fileList.length; i++) {
+                const item = fileList[i];
+                if (item.dayVal > noteDayVal) continue;
+                const matched = this.matchTaskInFile(item.fileKey, taskText, contextKey, context.ancestorTexts, context.childTexts, context.dateStr);
                 if (matched) {
+                    let res = null;
                     if (matched.isCleared) {
-                        return null;
-                    }
-                    const inherited = { ...matched };
-                    if (inherited.fromTracker && item.name !== fileKey) {
-                        return null;
-                    }
-                    if (inherited.repeat && /every\s+day|daily/i.test(inherited.repeat)) {
-                        const startDate = inherited.start ? window.moment(inherited.start, "YYYY-MM-DD") : null;
-                        if (!startDate || noteDate.isSameOrAfter(startDate, 'day')) {
-                            inherited.next = noteDate.clone().add(1, 'days').format("YYYY-MM-DD");
+                        res = null;
+                    } else if (matched.fromTracker && item.fileKey !== fileKey) {
+                        res = null;
+                    } else {
+                        res = { ...matched };
+                        if (res.repeat && DAILY_REPEAT_RE.test(res.repeat)) {
+                            if (!res.start || noteDateStr >= res.start) {
+                                res.next = nextDayStr;
+                            }
                         }
                     }
-                    if (!this.store.tasks[fileKey]) this.store.tasks[fileKey] = {};
-                    this.store.tasks[fileKey][contextKey || taskText] = inherited;
-                    return inherited;
+                    this._getTaskDataCache.set(cacheKey, res);
+                    return res;
                 }
             }
         }
+
+        this._getTaskDataCache.set(cacheKey, null);
         return null;
     }
 
@@ -3023,10 +3485,11 @@ module.exports = class DailyTasksPlugin extends Plugin {
         const stack = [];
         let lastWasBlank = false;
 
-        for (const line of lines) {
+        for (let idx = 0; idx < lines.length; idx++) {
+            const line = lines[idx];
             if (!line.trim()) {
                 if (!lastWasBlank && root.length > 0) {
-                    root.push({ raw: "", isBlank: true, indentLevel: 0, isTask: false, children: [] });
+                    root.push({ raw: "", isBlank: true, indentLevel: 0, isTask: false, lineIndex: idx, children: [] });
                     lastWasBlank = true;
                     stack.length = 0;
                 }
@@ -3037,12 +3500,13 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const indentStr = indentMatch ? indentMatch[1] : "";
             const indentLevel = indentStr.replace(/\t/g, "    ").length;
 
-            const isTask = /^\s*-\s*\[.\]/.test(line);
+            const isTask = TASK_LINE_RE.test(line);
             const item = {
                 raw: line,
                 isTask,
                 isBlank: false,
                 indentLevel,
+                lineIndex: idx,
                 children: []
             };
 
@@ -3083,14 +3547,13 @@ module.exports = class DailyTasksPlugin extends Plugin {
 
     filterTreeBySchedule(item, currentNoteTitle, prevNoteTitle, parentSchedule, ancestorTexts = []) {
         const noteDate = parseNoteDateFlexible(currentNoteTitle);
+        const noteDateStr = noteDate.format("YYYY-MM-DD");
         const cleanText = cleanTaskString(item.raw);
         const childTexts = item.children.map(c => cleanTaskString(c.raw));
         const contextKey = computeTaskKey(cleanText, ancestorTexts, childTexts);
 
-        let data = this.getTaskData(prevNoteTitle, cleanText, { contextKey, ancestorTexts, childTexts });
-        if (!data && parentSchedule) {
-            data = parentSchedule;
-        }
+        const ownData = this.getTaskData(prevNoteTitle, cleanText, { contextKey, ancestorTexts, childTexts });
+        let data = ownData || parentSchedule;
 
         let isDueToday = true;
         if (data) {
@@ -3098,23 +3561,26 @@ module.exports = class DailyTasksPlugin extends Plugin {
             const isDaily = interval && interval.days === 1 && !interval.weeks && !interval.months && !interval.years && !data.weekdays;
             const startDate = data.start ? window.moment(data.start, "YYYY-MM-DD") : null;
             const untilDate = data.until ? window.moment(data.until, "YYYY-MM-DD") : null;
-            if (isDaily && (!startDate || noteDate.isSameOrAfter(startDate, 'day'))) {
-                data = { ...data, next: noteDate.clone().add(1, 'days').format("YYYY-MM-DD") };
+            if (isDaily && (!startDate || noteDate.isSameOrAfter(startDate, "day"))) {
+                data = { ...data, next: noteDate.clone().add(1, "days").format("YYYY-MM-DD") };
             }
-            this.saveTaskData(currentNoteTitle, contextKey, {
-                ...data,
-                cleanText,
-                contextKey,
-                ancestorTexts,
-                childTexts
-            });
-            if (untilDate && noteDate.isAfter(untilDate, 'day')) {
+            if (ownData) {
+                this.saveTaskData(currentNoteTitle, contextKey, {
+                    ...data,
+                    cleanText,
+                    contextKey,
+                    ancestorTexts,
+                    childTexts
+                });
+            }
+            if (untilDate && noteDate.isAfter(untilDate, "day")) {
                 isDueToday = false;
-            } else if (startDate && noteDate.isBefore(startDate, 'day')) {
+            } else if (startDate && noteDate.isBefore(startDate, "day")) {
                 isDueToday = false;
             } else if (data.next) {
-                const nextM = window.moment(data.next, "YYYY-MM-DD");
-                isDueToday = nextM.isSameOrBefore(noteDate, 'day');
+                isDueToday = isIsoDateStr(data.next)
+                    ? data.next <= noteDateStr
+                    : window.moment(data.next, "YYYY-MM-DD").isSameOrBefore(noteDate, "day");
             }
         }
 
@@ -3134,6 +3600,15 @@ module.exports = class DailyTasksPlugin extends Plugin {
     }
 
     onunload() {
+        if (this.scanTimeout) {
+            clearTimeout(this.scanTimeout);
+            this.scanTimeout = null;
+        }
+        if (this._saveTimeout) {
+            clearTimeout(this._saveTimeout);
+            this._saveTimeout = null;
+            this.saveData(this.store);
+        }
         if (this.cleanupTimer) {
             window.clearInterval(this.cleanupTimer);
             this.cleanupTimer = null;

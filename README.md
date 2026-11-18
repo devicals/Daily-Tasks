@@ -33,8 +33,19 @@ also before all the more like juicy things one small yet big thing it does is ca
 
 # WHAT'S NEW??
 
+- made the plugin actually fast now instead of lagging obsidian to death on big daily notes or huge `data.json` files
+    - indexed task lookups and cached rollovers so it stops rescanning every single note on every keystroke and scroll
+    - stopped saving `data.json` to disk on every single character you type while renaming a task
+    - stopped duplicating parent task schedules onto every unscheduled subtask during rollover
+
 - bug fixes:
-    - fixed from X to Y and other components that occasionally will break
+    - fixed expired tracker task cleanup duplicating frontmatter/headings in tracker notes and writing `data.json` on startup for no reason
+    - fixed uncompleted non-repeating tracker tasks getting eaten by newer tracker tasks with the same name on rollover
+    - fixed tracker weekday tasks (`:: every saturday and sunday ::` etc.) not updating their `next` date properly
+    - fixed typing `:: some tag ::` halfway through falsely renaming the task in `data.json`, and fixed renaming a subtask deleting other subtasks with the same name
+    - fixed rescheduling a task on a daily note leaving duplicate `[due: ...]` entries behind
+    - fixed grandparent tasks not auto-checking in one go when subtasks are completed, and checked optional tasks losing their italic styling
+    - fixed `until X starting Y` (and `on <date>`) tag parsing, tab-switch scan race conditions, midnight date cache drift, and lost saves when closing obsidian
 
 
 # before i tell you how to use this here are some cool screenshots :)
